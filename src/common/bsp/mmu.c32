@@ -1,0 +1,605 @@
+//*----------------------------------------------------------------------------
+//*         ATMEL Microcontroller Software Support  -  ROUSSET  -
+//*----------------------------------------------------------------------------
+//* The software is delivered "AS IS" without warranty or condition of any
+//* kind, either express, implied or statutory. This includes without
+//* limitation any warranty or condition with respect to merchantability or
+//* fitness for any particular purpose, or against the infringements of
+//* intellectual property rights of others.
+//*----------------------------------------------------------------------------
+//* File Name           : mmu.c
+//* Object              : Common MMU and CACHE operations
+//* Creation            : ODi   Aug 22nd 02
+//*
+//*----------------------------------------------------------------------------
+#include "includes_fw.h"
+#include "lib_arm920t.h"
+#include "lib_retina.h"
+#include "os_cfg.h"
+#include "mmu.h"
+
+#define MMP_MMU_SECTION_PAGE_SIZE   (0x100000)
+#define MMP_MMU_SECTION_PAGE_MASK   (MMP_MMU_SECTION_PAGE_SIZE-1)
+#define MMP_MMU_SMALL_PAGE_SIZE     (4096)
+#define MMP_MMU_SMALL_PAGE_MASK     (MMP_MMU_SMALL_PAGE_SIZE-1)
+#define MMP_MMU_SMALL_PAGE_NUM      (MMP_MMU_SECTION_PAGE_SIZE/MMP_MMU_SMALL_PAGE_SIZE)   // 10487576/4096 = 256 pages
+#define MMP_MMU_COARSE_TABLE_NUM    (5)
+#define MMP_MMU_CACHE_PAGE_EN       (0x3<<2)
+#define MMP_MMU_CACHE_PAGE_DIS      (0)
+
+
+#define MMP_MMU_SET_L1_ENTRY_SECTION( table, virt_addr, phy_addr, cache ) ((MMP_ULONG *)(table))[(virt_addr)/MMP_MMU_SECTION_PAGE_SIZE] = ( \
+                                ((phy_addr)&~MMP_MMU_SECTION_PAGE_MASK) |   /* Physical Address */ \
+                                (3 << 10) |                     /* Access in supervisor mode, this bits are ignore because domain in CP15:c3 is 0b11 */ \
+                                (15 << 5) |                     /* Domain, always 15 */ \
+                                (1 << 4) |                      /* Must be 1, according to ARM spec */ \
+                                (cache) |                       /* Cache type, only MMP_MMU_CACHE_PAGE_EN or MMP_MMU_CACHE_PAGE_DIS */ \
+                                0x2 )                           /* Set entry as section */
+
+#define MMP_MMU_SET_L1_ENTRY_COARSE( table, addr, coarse_table ) ((MMP_ULONG *)(table))[(addr)/MMP_MMU_SECTION_PAGE_SIZE] = ( \
+                                ((MMP_ULONG)(coarse_table)&0xFFFFFC00) |   /* Physical Address */ \
+                                (15 << 5) |                     /* Domain, always 15 */ \
+                                (1 << 4) |                      /* Must be 1, according to ARM spec */ \
+                                0x1 )                           /* Set entry as coarse table */
+
+#define MMP_MMU_SET_L2_ENTRY_SMALL_PAGE( table, base_addr, index, cache ) ((MMP_ULONG*)(table))[index] = ( \
+                                ((base_addr) + (index) * MMP_MMU_SMALL_PAGE_SIZE) |     /* Physical Address */ \
+                                (cache) |                       /* Cache type, only MMP_MMU_CACHE_PAGE_EN or MMP_MMU_CACHE_PAGE_DIS */ \
+                                0x2 )                           /* Set entry as small page*/
+
+
+/** @addtogroup BSP
+@{
+*/
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_CleanDCache
+//* \brief Clean and invalidate D Cache
+//*----------------------------------------------------------------------------
+//#if !defined(MINIBOOT_FW)
+void AT91F_CleanDCache()
+{
+    register int seg, index;
+    int setsize = 128;
+
+    /* ARM926EJ-S */
+    /// For ARM926EJ-S, seg is the index of "WAY", index is the index of "set".
+    /// ("WAY is ""LINE", 4-WAY means 4 lines in each "set")
+
+    /// ARM926EJ-S addressing is WAY at the first, then SET.
+    for (seg = 0; seg < 4; ++seg) {
+        for (index = 0; index < setsize; ++index) {
+            AT91F_ARM_CleanDCacheIDX((seg << 30) | (index << 5));
+        }
+    }
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_ResetICache
+//* \brief Reset I Cache (Should be run from a non cachable area)
+//*----------------------------------------------------------------------------
+void AT91F_ResetICache ()
+{
+    // Flush I TLB
+    AT91F_ARM_InvalidateITLB();
+    // Flush I cache
+    AT91F_ARM_InvalidateICache();
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_ResetDCache
+//* \brief Reset D Cache (Should be run from a non cachable area)
+//*----------------------------------------------------------------------------
+void AT91F_ResetDCache ()
+{
+    // Achieve pending write operations
+    AT91F_CleanDCache();
+    // Flush write buffers
+    AT91F_ARM_DrainWriteBuffer();
+    // Flush D TLB
+    AT91F_ARM_InvalidateDTLB();
+    // Flush D cache
+    AT91F_ARM_InvalidateDCache();
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_EnableMMU
+//* \brief Enable MMU
+//*----------------------------------------------------------------------------
+void AT91F_EnableMMU ()
+{
+	unsigned int ctl;
+
+#ifdef __GNUC__
+    AT91F_ARM_ReadControl(ctl);
+    ctl |= (1 << 0);
+    AT91F_ARM_WriteControl(ctl);
+#else
+	ctl = AT91F_ARM_ReadControl();
+	ctl |= (1 << 0);
+	AT91F_ARM_WriteControl(ctl);
+#endif
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_DisableMMU
+//* \brief Disable MMU
+//*----------------------------------------------------------------------------
+void AT91F_DisableMMU ()
+{
+	unsigned int ctl;
+
+#ifdef __GNUC__
+    AT91F_ARM_ReadControl(ctl);
+    ctl &= ~(1 << 0);
+    AT91F_ARM_WriteControl(ctl);
+#else
+	ctl = AT91F_ARM_ReadControl();
+	ctl &= ~(1 << 0);
+	AT91F_ARM_WriteControl(ctl);
+#endif
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_EnableICache
+//* \brief Enable I Cache
+//*----------------------------------------------------------------------------
+void AT91F_EnableICache ()
+{
+	unsigned int ctl;
+#ifdef __GNUC__
+    AT91F_ARM_ReadControl(ctl);
+    ctl |= (1 << 12);
+    AT91F_ARM_WriteControl(ctl);
+#else
+	ctl = AT91F_ARM_ReadControl();
+	ctl |= (1 << 12);
+	AT91F_ARM_WriteControl(ctl);
+#endif
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_DisableICache
+//* \brief Disable I Cache
+//*----------------------------------------------------------------------------
+void AT91F_DisableICache ()
+{
+	unsigned int ctl;
+
+#ifdef __GNUC__
+    AT91F_ARM_ReadControl(ctl);
+    ctl &= ~(1 << 12);
+    AT91F_ARM_WriteControl(ctl);
+#else
+	ctl = AT91F_ARM_ReadControl();
+	ctl &= ~(1 << 12);
+	AT91F_ARM_WriteControl(ctl);
+#endif
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_EnableDCache
+//* \brief Enable D Cache
+//*----------------------------------------------------------------------------
+void AT91F_EnableDCache ()
+{
+	unsigned int ctl;
+
+#ifdef __GNUC__
+    AT91F_ARM_ReadControl(ctl);
+    ctl |= (1 << 2);
+    AT91F_ARM_WriteControl(ctl);
+#else
+	ctl = AT91F_ARM_ReadControl();
+	ctl |= (1 << 2);
+	AT91F_ARM_WriteControl(ctl);
+#endif
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_DisableDCache
+//* \brief Disable D Cache
+//*----------------------------------------------------------------------------
+void AT91F_DisableDCache ()
+{
+	unsigned int ctl;
+#ifdef __GNUC__
+    AT91F_ARM_ReadControl(ctl);
+    ctl &= ~(1 << 2);
+    AT91F_ARM_WriteControl(ctl);
+#else
+	ctl = AT91F_ARM_ReadControl();
+	ctl &= ~(1 << 2);
+	AT91F_ARM_WriteControl(ctl);
+#endif
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_LockITLB
+//* \brief Lock one I TLB entry after entries previously locked
+//*----------------------------------------------------------------------------
+void AT91F_LockITLB (unsigned int address)
+{
+	// Set the P bit
+	AT91F_ARM_WriteITLBLockdown(1); // base 0 victim 0 P 1
+	// Prefetch the instruction assuming an ITLB miss occurs, the entry base is loaded
+	AT91F_ARM_PrefetchICacheLine(address);
+	// Update base and victim values
+	AT91F_ARM_WriteITLBLockdown((1 << 26) | (1 << 20)); // base 1 victim 1 P 0
+}
+
+//*----------------------------------------------------------------------------
+//* \fn    AT91F_ARM_WriteITLBLockdown
+//* \brief Write I TLB lockdown  (Should be run from a non cachable area)
+//*----------------------------------------------------------------------------
+void AT91F_LockICache (unsigned int startAddress, unsigned int size)
+{
+	unsigned int victim = 0;
+
+    AT91F_ARM_InvalidateICache();
+    AT91F_ARM_WriteICacheLockdown((victim++) << 26);
+    while (size) {
+        // Prefetch ICache line
+        AT91F_ARM_PrefetchICacheLine(startAddress);
+        startAddress += 32;
+        // Test for segment 0, and if so increment victim pointer
+        if ( !(startAddress & 0xE0) )
+            AT91F_ARM_WriteICacheLockdown((victim++) << 26);
+        size -= 32;
+
+    }
+    // If segment != 0 the increment victim pointer
+    if ( (startAddress & 0xE0) )
+        AT91F_ARM_WriteICacheLockdown(victim << 26);
+}
+
+#if defined(ALL_FW)||defined(MBOOT_EX_FW)
+static __inline MMP_BOOL MMPF_MMU_IsSectionPage( MMP_ULONG *pTranslationTable, MMP_ULONG ulAddr )
+{
+    return ((pTranslationTable[ulAddr/MMP_MMU_SECTION_PAGE_SIZE] & 0x3) == 2)?1:0;
+}
+
+static __inline MMP_ULONG* MMPF_MMU_GetCurrentCoarseTable( MMP_ULONG *pTranslationTable, MMP_ULONG ulAddr )
+{
+    return (MMP_ULONG *)(pTranslationTable[ulAddr/MMP_MMU_SECTION_PAGE_SIZE] & 0xFFFFFC00);
+}
+
+static __inline void MMPF_MMU_ReleaseCurrentCoarseTable( MMP_ULONG *pTranslationTable, MMP_ULONG ulVirtAddr, MMP_ULONG ulCacheable )
+{
+    MMP_ULONG * pCoarseTable = MMPF_MMU_GetCurrentCoarseTable(pTranslationTable, ulVirtAddr);
+    MMP_ULONG i;
+	MMP_ULONG ulPhyAddr = pCoarseTable[0] & ~MMP_MMU_SMALL_PAGE_MASK;
+
+    // Set the L1 entry as section
+    MMP_MMU_SET_L1_ENTRY_SECTION( pTranslationTable, ulVirtAddr, ulPhyAddr, ulCacheable );
+
+    // Clean coarse table
+    for( i = 0; i < MMP_MMU_SMALL_PAGE_NUM; i++ )
+        pCoarseTable[i] = 0;
+}
+
+static void MMPF_MMU_InitCoarseTable(MMP_ULONG *pTranslationTable, MMP_ULONG *pCoarsePageTable, MMP_ULONG ulStartAddr, MMP_ULONG ubCacheable )
+{
+    MMP_ULONG i;
+
+    // Reassign the start address from the begining of 1MB
+    ulStartAddr &= ~MMP_MMU_SECTION_PAGE_MASK;
+
+    // Reset all L2 table entries as noncached small pages
+    for( i=0; i<MMP_MMU_SMALL_PAGE_NUM; i++ )
+    {
+        MMP_MMU_SET_L2_ENTRY_SMALL_PAGE( pCoarsePageTable, ulStartAddr, i, ubCacheable );
+    }
+
+    // Assign a L2 coarse table to L1 entry
+    MMP_MMU_SET_L1_ENTRY_COARSE( pTranslationTable, ulStartAddr, pCoarsePageTable );
+}
+
+
+static void MMPF_MMU_SetCoarseTable(MMP_ULONG *pCoarsePageTable, MMP_ULONG ulStartAddr, MMP_ULONG ulDataSize, MMP_ULONG ulCacheable )
+{
+    // Convert the start address and size to start page(ulStartAddr) and end page(ulDataSize)
+    ulDataSize = ((ulStartAddr+ulDataSize-1)&MMP_MMU_SECTION_PAGE_MASK)/MMP_MMU_SMALL_PAGE_SIZE;
+    ulStartAddr = (ulStartAddr&MMP_MMU_SECTION_PAGE_MASK)/MMP_MMU_SMALL_PAGE_SIZE;
+
+    // Assig cachealbe page to L2 table
+    for( ; ulStartAddr<=ulDataSize; ulStartAddr++ )
+    {
+        if( ulCacheable )
+            pCoarsePageTable[ulStartAddr] |= MMP_MMU_CACHE_PAGE_EN;  // Cachealbe (cache+write buffer)
+        else
+            pCoarsePageTable[ulStartAddr] &= ~MMP_MMU_CACHE_PAGE_EN; // Noncachealbe
+    }
+}
+
+
+static MMP_ULONG* MMPF_MMU_GetCoarseTable(MMP_ULONG *pTranslationTable, MMP_ULONG *pCoarsePageTables, MMP_ULONG ulAddr )
+{
+    MMP_LONG i;
+    MMP_ULONG ulCacheable;
+
+    // If the coarse table is established, return the existed one.
+    if( !MMPF_MMU_IsSectionPage(pTranslationTable, ulAddr) )
+    {
+        return MMPF_MMU_GetCurrentCoarseTable( pTranslationTable, ulAddr );
+    }
+
+    // Looking for a empty table
+    for( i=0; i<MMP_MMU_COARSE_TABLE_NUM*MMP_MMU_SMALL_PAGE_NUM; i+=MMP_MMU_SMALL_PAGE_NUM )
+    {
+        if( pCoarsePageTables[i] == 0 )
+            break;
+    }
+
+    // no empty table?
+    if( i >= MMP_MMU_COARSE_TABLE_NUM*MMP_MMU_SMALL_PAGE_NUM )
+        return NULL;
+
+    ulCacheable = pTranslationTable[ulAddr/MMP_MMU_SECTION_PAGE_SIZE] & MMP_MMU_CACHE_PAGE_EN;
+
+    // init coarse table
+    MMPF_MMU_InitCoarseTable( pTranslationTable, pCoarsePageTables+i, ulAddr, ulCacheable );
+
+    return pCoarsePageTables+i;
+}
+
+static void MMPF_MMU_ConfigRegionSection( MMP_ULONG *pTranslationTable, MMP_ULONG ulStartAddr, MMP_ULONG ulCacheable )
+{
+    if( MMPF_MMU_IsSectionPage( pTranslationTable, ulStartAddr ) )
+    {
+
+        if( ulCacheable )
+            pTranslationTable[ulStartAddr/MMP_MMU_SECTION_PAGE_SIZE] |= MMP_MMU_CACHE_PAGE_EN;    // Cachealbe (cache+write buffer)
+        else
+            pTranslationTable[ulStartAddr/MMP_MMU_SECTION_PAGE_SIZE] &= ~MMP_MMU_CACHE_PAGE_EN;   // Noncachealbe
+    }
+    else
+    {
+        MMPF_MMU_ReleaseCurrentCoarseTable( pTranslationTable, ulStartAddr, ulCacheable );
+    }
+}
+
+static void MMPF_MMU_ConfigRegionCoarse( MMP_ULONG *pTranslationTable, MMP_ULONG *pCoarsePageTable, MMP_ULONG ulStartAddr, MMP_ULONG ulSize, MMP_ULONG ulCacheable )
+{
+    MMP_ULONG i;
+
+    pCoarsePageTable = MMPF_MMU_GetCoarseTable( pTranslationTable, pCoarsePageTable, ulStartAddr );
+
+    // no avilibe coarse table, so nothing to do
+    if( pCoarsePageTable == NULL )
+    {
+        return;
+    }
+
+    // Update coarse table
+    MMPF_MMU_SetCoarseTable( pCoarsePageTable, ulStartAddr, ulSize, ulCacheable );
+
+    // Check coarse table
+    ulCacheable = pCoarsePageTable[0] & MMP_MMU_CACHE_PAGE_EN;
+    for( i=1; i<MMP_MMU_SMALL_PAGE_NUM; i++ )
+    {
+        // return is the cache setting in coarse table is not the same
+        if( ulCacheable != (pCoarsePageTable[i] & MMP_MMU_CACHE_PAGE_EN) )
+            return;
+    }
+
+    // if all cache setting is the same, repelase the coarse table
+    MMPF_MMU_ReleaseCurrentCoarseTable( pTranslationTable, ulStartAddr, ulCacheable );
+}
+
+static void MMPF_MMU_ConfigRegion( MMP_ULONG *pTranslationTable, MMP_ULONG *pCoarsePageTable, MMP_ULONG ulStartAddr, MMP_ULONG ulEndAddr, MMP_ULONG ulCacheable )
+{
+    MMP_ULONG ulSectionAddr;
+
+    // do nothing if both addreesses are the same
+    if( ulStartAddr == ulEndAddr )
+    {
+        return;
+    }
+
+    ulSectionAddr = ulStartAddr&~MMP_MMU_SECTION_PAGE_MASK;
+
+    // Reassing the value to reduce the process of cache setting
+    ulCacheable = ulCacheable ? MMP_MMU_CACHE_PAGE_EN : MMP_MMU_CACHE_PAGE_DIS;
+
+    // In one section?
+    if( (ulEndAddr&~MMP_MMU_SECTION_PAGE_MASK) == ulSectionAddr )
+    {
+        MMPF_MMU_ConfigRegionCoarse( pTranslationTable, pCoarsePageTable, ulStartAddr, ulEndAddr-ulStartAddr, ulCacheable );
+    }
+    else
+    {
+        MMP_ULONG ulSectionEnd;
+
+        // If the ulStartAddr is not 0 modulo 1MB, process as coarse at first
+        if( ulSectionAddr != ulStartAddr )
+        {
+            MMPF_MMU_ConfigRegionCoarse( pTranslationTable, pCoarsePageTable, ulStartAddr, MMP_MMU_SECTION_PAGE_SIZE-(ulStartAddr&MMP_MMU_SECTION_PAGE_MASK), ulCacheable );
+            ulSectionAddr += MMP_MMU_SECTION_PAGE_SIZE;
+        }
+
+        // Calculate end of section
+        ulSectionEnd = ulEndAddr&~MMP_MMU_SECTION_PAGE_MASK;
+
+        // Change the cacheable for each section page
+        for( ; ulSectionAddr<ulSectionEnd; ulSectionAddr += MMP_MMU_SECTION_PAGE_SIZE )
+        {
+            MMPF_MMU_ConfigRegionSection( pTranslationTable, ulSectionAddr, ulCacheable );
+        }
+
+        // If the ulEndAddr is not 0 modulo 1MB, process as coarse
+        if( ulEndAddr&MMP_MMU_SECTION_PAGE_MASK )
+        {
+            MMPF_MMU_ConfigRegionCoarse( pTranslationTable, pCoarsePageTable, ulSectionAddr, ulEndAddr&MMP_MMU_SECTION_PAGE_MASK, ulCacheable );
+        }
+
+    }
+}
+
+
+/** @Initialize code region in MMU table
+
+@note      Make code region as cachealbe
+@param[in] pTranslationTable The starting address of the 1MB granularity cache table.
+           This address should be 16K bytes alignment in 820. 16KB size.
+@param[in] pCoarsePageTable The starting address of the 4K granularity cache table.
+           It has to be 1K alignment. 1KB size.
+*/
+static void MMPF_MMU_InitCodeRegion(MMP_ULONG *pTranslationTable, MMP_ULONG *pCoarsePageTable)
+{
+	extern unsigned char* __RESET_START__;
+	extern unsigned char* __RESET_END__;
+
+	MMPF_MMU_ConfigRegion
+	(
+		pTranslationTable,
+		pCoarsePageTable,
+		(MMP_ULONG) & __RESET_START__,
+		((MMP_ULONG) & __RESET_END__) + RSVD_HEAP_SIZE,
+		MMP_MMU_CACHE_PAGE_EN
+	);
+
+}
+#endif
+
+/** @brief Initialize the MMU setting.
+
+@note Free addresses from pTranslationTable: 0x8~0x3C, 0x48~0x1FFC, 0x2004~0x3FF8
+@param[in] pTranslationTable The starting address of the 1MB granularity cache table.
+           This address should be 16K bytes alignment in 820. 16KB size.
+@param[in] pCoarsePageTable The starting address of the 4K granularity cache table.
+           It has to be 1K alignment. 1KB size.
+*/
+void MMPF_MMU_Initialize(unsigned int *pTranslationTable,unsigned int *pCoarsePageTable)
+{
+    MMP_ULONG i;
+
+    // The addr of translation table must be 16KB alignment
+    if (((MMP_ULONG)pTranslationTable & (0x4000-1)) > 0) {
+        return;
+    }
+
+    // Disable cache & MMU
+    AT91F_DisableICache();
+    AT91F_DisableDCache();
+    AT91F_DisableMMU();
+
+    // Program the TTB
+    AT91F_ARM_WriteTTB((unsigned int) pTranslationTable);
+    // Program the domain access register
+    AT91F_ARM_WriteDomain(0xC0000000); // domain 15: access are not checked
+
+    // Reset table entries
+    for (i = 0; i < 4096; i++)
+        pTranslationTable[i] = 0;
+
+    // Program level 1 page table entry, 0x0~0x3 bytes
+    MMP_MMU_SET_L1_ENTRY_SECTION( pTranslationTable, 0x00000000, 0x00000000, MMP_MMU_CACHE_PAGE_DIS );
+
+    // Config mmu for SRAM: Cacheable
+    MMP_MMU_SET_L1_ENTRY_SECTION( pTranslationTable, 0x00100000, 0x00100000, MMP_MMU_CACHE_PAGE_EN );
+
+    #if (CHIP == MCR_V2)
+    // Config mmu for programming TCM within another CPU
+    //Config mmu for CM of CPU_A (can be accessed by CPU_B only)
+    MMP_MMU_SET_L1_ENTRY_SECTION( pTranslationTable, 0x00800000, 0x00800000, MMP_MMU_CACHE_PAGE_DIS );
+    #endif
+
+    //Config mmu for DRAM : Non-Cacheable
+    for (i = 0x10; i < ((DRAM_SIZE >> 20) + 0x10); i++)
+    {
+        MMP_MMU_SET_L1_ENTRY_SECTION( pTranslationTable, i<<20, i<<20, MMP_MMU_CACHE_PAGE_DIS );
+    }
+
+    //Config mmu for DRAM : Cacheable
+    for (i = 0x10; i < ((DRAM_SIZE >> 20) + 0x10); i++)
+    {
+        MMP_MMU_SET_L1_ENTRY_SECTION( pTranslationTable, (i|MMU_DRAM_VA_ST)<<20, i<<20, MMP_MMU_CACHE_PAGE_EN );
+    }
+
+    //OPR
+    MMP_MMU_SET_L1_ENTRY_SECTION( pTranslationTable, 0x80000000, 0x80000000, MMP_MMU_CACHE_PAGE_DIS );
+
+    //ARM's peripheral
+    MMP_MMU_SET_L1_ENTRY_SECTION( pTranslationTable, 0xFFF00000, 0xFFF00000, MMP_MMU_CACHE_PAGE_DIS );
+
+#if defined(ALL_FW)||defined(MBOOT_EX_FW)
+    MMPF_MMU_InitCodeRegion(pTranslationTable, pCoarsePageTable);
+#endif
+
+    // Enable the MMU
+    AT91F_EnableMMU();
+    AT91F_EnableICache();
+    AT91F_EnableDCache();
+}
+
+/**
+ *  Used to unload the MMU so that we can assign MMU to another address.
+ *  Due to most of the functions are without parameters and returen value.
+ *  So this function are designed so.
+ */
+// Note that these 2 MMPF_ functions are added in bsp.h
+void MMPF_MMU_Deinitialize(void)
+{
+	AT91F_CleanDCache();
+	AT91F_DisableDCache();
+	AT91F_DisableICache();
+	AT91F_DisableMMU();
+	AT91F_ResetICache();
+	AT91F_ResetDCache();
+}
+
+/// @brief Flush the D cache and the write buffer to memory.
+void MMPF_MMU_CleanDCache(void)
+{
+	// Achieve pending write operations
+	AT91F_CleanDCache();
+	// Flush write buffers
+	AT91F_ARM_DrainWriteBuffer();
+}
+
+void MMPF_MMU_InvalidateDCacheMVA(MMP_ULONG ulRegion, MMP_ULONG ulSize)
+{
+    MMP_ULONG	i;
+    MMP_ULONG	start_addr, end_addr;
+    start_addr = ulRegion;
+    end_addr = ulRegion + ulSize;
+
+    for (i = start_addr; i < end_addr; i += 32) {
+        AT91F_ARM_InvalidateDCacheMVA(i);
+    }
+}
+
+//#endif // !defined(MINIBOOT_FW)
+
+void MMPF_MMU_FlushDCacheMVA(MMP_ULONG ulRegion, MMP_ULONG ulSize)
+{
+    MMP_ULONG	i;
+    MMP_ULONG	start_addr, end_addr;
+    start_addr = FLOOR32(ulRegion);
+    end_addr = ALIGN32(ulRegion + ulSize);
+
+    for (i = start_addr; i < end_addr; i += 32) {
+        AT91F_ARM_CleanInvalidateDCacheMVA(i);
+    }
+    // Flush write buffers
+    AT91F_ARM_DrainWriteBuffer();
+}
+
+void MMPF_MMU_FlushDCache(void)
+{
+    MMP_ULONG	i;
+    MMP_ULONG	index;
+    int setsize = 128;
+
+    for (i = 0; i < 4; ++i) {
+        for (index = 0; index < setsize; ++index) {
+            AT91F_ARM_CleanInvalidateDCacheIDX((i << 30) | (index << 5));
+        }
+    }
+
+    // Flush write buffers
+    AT91F_ARM_DrainWriteBuffer();
+}
+
+/** @} */

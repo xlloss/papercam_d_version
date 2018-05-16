@@ -1,0 +1,201 @@
+//*----------------------------------------------------------------------------
+//* The software is delivered "AS IS" without warranty or condition of any
+//* kind, either express, implied or statutory. This includes without
+//* limitation any warranty or condition with respect to merchantability or
+//* fitness for any particular purpose, or against the infringements of
+//* intellectual property rights of others.
+//*----------------------------------------------------------------------------
+//* File Name           : audio_p_fw.c32
+//* Object              : Config System Software Environment by Firmware Type
+//* Creation            : Philip Lin at 2008/7/2 17:53
+//*
+//*----------------------------------------------------------------------------
+
+#include "all_fw.h" 
+#include "includes_fw.h"
+#include "lib_retina.h"
+
+//==============================================================================
+//
+//                              EXTERN VARIABLES
+//
+//==============================================================================
+
+extern OS_STK           SENSOR_Task_Stk[];
+extern OS_STK           MP4VENC_Task_Stk[];
+
+extern OS_STK           VSTREAM_Task_Stk[];
+extern OS_STK           JSTREAM_Task_Stk[];
+extern OS_STK           AUD_CriticalTask_Stk[];
+extern OS_STK           AUD_EncodeTask_Stk[];
+#if (SUPPORT_ALSA)
+extern OS_STK           AUD_AlsaTask_Stk[];
+#endif
+extern OS_STK           STREAMER_Task_Stk[];
+
+extern OS_STK           OSD_Task_Stk[];
+
+#if (SUPPORT_MDTC)
+extern OS_STK           MDTC_Task_Stk[];
+#endif
+
+#if (SUPPORT_IVA)
+extern OS_STK           IVA_Task_Stk[];
+#endif
+
+
+OS_STK                  JOB_DISPATCH_Task_Stk[TASK_JOB_DISPATCH_STK_SIZE];
+
+/* For CPU IPC */
+extern OS_STK           CPUB_StartTask_Stk[];
+
+extern OS_STK           MISC_IO_Task_Stk[] ;
+
+//==============================================================================
+//
+//                              FUNCTIONS
+//
+//==============================================================================
+extern MMP_BOOL UI_Get_DualCPU(void) ;
+
+
+//------------------------------------------------------------------------------
+//  Function    : CE_JOB_DISPATCH_Task_Entry
+//  Description : Task entry function for FS function
+//------------------------------------------------------------------------------
+void UI_Main_Task(void *p_arg);
+
+void CE_JOB_DISPATCH_TaskHandler(void *p_arg)
+{
+    UI_Main_Task(p_arg);
+}
+
+//------------------------------------------------------------------------------
+//  Function    : CPUB_Start_TaskHandler
+//  Description : CPU_B Startup function
+//------------------------------------------------------------------------------
+void CpuB_SysStartup(void *p_arg);
+
+void CPUB_Start_TaskHandler(void *p_arg)
+{
+    CpuB_SysStartup(p_arg);
+}
+
+/** @addtogroup BSP
+@{
+*/
+
+//*----------------------------------------------------------------------------
+//* \fn    MMPF_SWPACK_TaskInit
+//* \brief Application specific MMU configurations for SRAM and DRAM
+//*----------------------------------------------------------------------------
+void MMPF_SWPACK_TaskInit()
+{
+    MMPF_TASK_CFG   task_cfg;
+
+    /* MMPF_MMU_Initialize((MMP_ULONG *)MMU_TRANSLATION_TABLE_ADDR,(MMP_ULONG *)MMU_COARSEPAGE_TABLE_ADDR); */
+
+    #if (SENSOR_EN)
+    task_cfg.ubPriority = TASK_SENSOR_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&SENSOR_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&SENSOR_Task_Stk[TASK_SENSOR_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_SENSOR_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"SENSOR");
+    #endif
+
+    #if (VIDEO_R_EN)
+    task_cfg.ubPriority = TASK_VSTREAM_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&VSTREAM_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&VSTREAM_Task_Stk[VSTREAM_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_VStream_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"VSTREAM");
+
+    task_cfg.ubPriority = TASK_MP4VENC_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&MP4VENC_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&MP4VENC_Task_Stk[MP4VENC_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_MP4VENC_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"MP4VENC");
+    #endif
+
+    #if (AUDIO_R_EN)
+    task_cfg.ubPriority = TASK_AUD_CRITICAL_PRIO;
+    task_cfg.pbos = (INT32U)&AUD_CriticalTask_Stk[0];
+    task_cfg.ptos = (INT32U)&AUD_CriticalTask_Stk[AUD_CRITICAL_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_Audio_CriticalTaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"AUDCRIT");
+
+    task_cfg.ubPriority = TASK_AUD_ENCODE_PRIO;
+    task_cfg.pbos = (INT32U)&AUD_EncodeTask_Stk[0];
+    task_cfg.ptos = (INT32U)&AUD_EncodeTask_Stk[AUD_ENCODE_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_Audio_EncodeTaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"AUDENC");
+    #endif
+
+    #if (SUPPORT_ALSA)
+    task_cfg.ubPriority = TASK_ALSA_PRIO;
+    task_cfg.pbos = (INT32U)&AUD_AlsaTask_Stk[0];
+    task_cfg.ptos = (INT32U)&AUD_AlsaTask_Stk[ALSA_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_Alsa_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"ALSA");
+    #endif
+
+    #if (DSC_R_EN)
+    task_cfg.ubPriority = TASK_JSTREAM_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&JSTREAM_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&JSTREAM_Task_Stk[JSTREAM_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_JStream_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"JSTREAM");
+    #endif
+
+    task_cfg.ubPriority = TASK_STREAMER_PRIO;
+    task_cfg.pbos = (INT32U)&STREAMER_Task_Stk[0];
+    task_cfg.ptos = (INT32U)&STREAMER_Task_Stk[STREAMER_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_Streamer_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"STREAMER");
+
+    task_cfg.ubPriority = TASK_OSD_PRIO;
+    task_cfg.pbos = (INT32U)&OSD_Task_Stk[0];
+    task_cfg.ptos = (INT32U)&OSD_Task_Stk[OSD_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_OSD_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"OSD");
+
+    #if (SUPPORT_MDTC)
+    task_cfg.ubPriority = TASK_MDTC_PRIO;
+    task_cfg.pbos = (INT32U)&MDTC_Task_Stk[0];
+    task_cfg.ptos = (INT32U)&MDTC_Task_Stk[MDTC_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_MDTC_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"MDTC");
+    #endif
+
+    #if (SUPPORT_IVA)
+    task_cfg.ubPriority = TASK_IVA_PRIO;
+    task_cfg.pbos = (INT32U)&IVA_Task_Stk[0];
+    task_cfg.ptos = (INT32U)&IVA_Task_Stk[IVA_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_IVA_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"IVA");
+    #endif
+
+
+    task_cfg.ubPriority = TASK_JOB_DISPATCH_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&JOB_DISPATCH_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&JOB_DISPATCH_Task_Stk[TASK_JOB_DISPATCH_STK_SIZE-1];
+    MMPF_OS_CreateTask(CE_JOB_DISPATCH_TaskHandler, &task_cfg, (void *)"JOB");
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"JOB_DISPATCH");
+
+    if( UI_Get_DualCPU() ) {
+        task_cfg.ubPriority = TASK_CPUB_START_PRIO;
+        task_cfg.pbos = (MMP_ULONG)&CPUB_StartTask_Stk[0];
+        task_cfg.ptos = (MMP_ULONG)&CPUB_StartTask_Stk[TASK_B_SYS_STK_SIZE-1];
+        MMPF_OS_CreateTask(CPUB_Start_TaskHandler, &task_cfg, (void *)"CPUB");
+        MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"CPUB");
+    }
+    
+    task_cfg.ubPriority = TASK_B_MISC_IO_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&MISC_IO_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&MISC_IO_Task_Stk[TASK_B_MISC_IO_SIZE-1];
+    MMPF_OS_CreateTask(MISC_IO_TaskHandler, &task_cfg, (void *)"IO");
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"MISC_IO");
+    
+    
+}
+/** @} */ /* End of BSP */

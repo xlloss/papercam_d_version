@@ -1,0 +1,59 @@
+//==============================================================================
+//
+//  File        : mmpf_audio_task.c32
+//  Description : Audio Task Entry
+//  Author      : Hans Liu
+//  Revision    : 1.0
+//
+//==============================================================================
+
+#include "includes_fw.h"
+#include "lib_retina.h"
+
+/** @addtogroup MMPF_AUDIO
+@{
+*/
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+
+#if defined(ALL_FW)
+OS_STK      AUD_CriticalTask_Stk[AUD_CRITICAL_STK_SIZE];
+extern void MMPF_Audio_CriticalTask(void);
+OS_STK      AUD_EncodeTask_Stk[AUD_ENCODE_STK_SIZE];
+extern void MMPF_Audio_EncodeTask(void);
+#if (SUPPORT_ALSA)
+OS_STK      AUD_AlsaTask_Stk[ALSA_STK_SIZE];
+extern void MMPF_Alsa_Task(void);
+#endif
+#endif
+
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+#if defined(ALL_FW)
+void MMPF_Audio_CriticalTaskHandler(void *p_arg)
+{
+    MMPF_Audio_CriticalTask();
+}
+
+void MMPF_Audio_EncodeTaskHandler(void *p_arg)
+{
+    MMPF_Audio_EncodeTask();
+}
+
+#if (SUPPORT_ALSA)
+void MMPF_Alsa_TaskHandler(void *p_arg)
+{
+    MMPF_Alsa_Task();
+}
+#endif
+#endif // defined(ALL_FW)
+
+/// @}

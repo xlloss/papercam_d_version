@@ -1,0 +1,49 @@
+/**
+ @file mmpf_stream_task.c32
+ @brief Task functions of Streamer
+ @author Alterman
+ @version 1.0
+*/
+
+#include "includes_fw.h"
+#include "lib_retina.h"
+#include "all_fw.h"
+
+/** @addtogroup MMPF_STREAMER
+@{
+*/
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+/*
+ * Local Variables
+ */
+#if defined(ALL_FW)
+OS_STK  OSD_Task_Stk[OSD_STK_SIZE];
+#endif
+
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+extern void MMPF_OSD_Task(void);
+
+//==============================================================================
+//
+//                              FUNCTION DEFINITION
+//
+//==============================================================================
+
+#if defined(ALL_FW)
+void MMPF_OSD_TaskHandler(void *p_arg)
+{
+    MMPF_OSD_Task();
+}
+#endif
+
+/// @}

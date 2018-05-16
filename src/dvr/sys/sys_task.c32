@@ -1,0 +1,360 @@
+//==============================================================================
+//
+//  File        : sys_task.c32
+//  Description : Main entry function of system
+//  Author      : Jerry Tsao
+//  Revision    : 1.0
+//
+//==============================================================================
+
+#include "includes_fw.h"
+#include "config_fw.h"
+#include "lib_retina.h"
+#include "ait_config.h"
+
+#include "mmps_system.h"
+
+#include "mmpf_hif.h"
+#include "mmpf_pll.h"
+#include "mmpf_dram.h"
+#include "mmp_reg_gbl.h"
+#include "mmp_reg_wd.h"
+#include "mmpf_wd.h"
+
+/** @addtogroup MMPF_SYS
+@{
+*/
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+
+///////////////////////
+// System Task Stack //
+///////////////////////
+
+#if !defined(MINIBOOT_FW)
+/* #pragma arm section rwdata = "EnterSelfSleepMode",  zidata = "EnterSelfSleepMode" */
+OS_STK  SYS_Task_Stk[TASK_SYS_STK_SIZE];
+/* #pragma arm section rwdata, zidata */
+OS_STK  LTASK_Task_Stk[LTASK_STK_SIZE];
+#endif
+
+//////////////////
+// System Event //
+//////////////////
+MMPF_OS_FLAGID  SYS_Flag_Hif;
+MMPF_OS_FLAGID  SENSOR_Flag;
+MMPF_OS_FLAGID  DSC_Flag;
+MMPF_OS_FLAGID  AUD_REC_Flag;
+MMPF_OS_FLAGID  VID_REC_Flag;
+MMPF_OS_FLAGID  STREAMER_Flag;
+MMPF_OS_FLAGID  OSD_Flag;
+MMPF_OS_FLAGID  DSC_UI_Flag;
+MMPF_OS_FLAGID  IPC_UI_Flag;
+#if (SUPPORT_MDTC)
+MMPF_OS_FLAGID  MDTC_Flag;
+#endif
+#if (SUPPORT_IVA)
+MMPF_OS_FLAGID  IVA_Flag;
+#endif
+
+MMPF_OS_SEMID   SYS_Sem_Hif[GRP_IDX_NUM];
+
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+void            MMPF_SYS_Task(void);
+static void     CreateTasks(void);
+static void     CreateEvents(void);
+extern void     MMPF_SWPACK_TaskInit(void);
+extern MMP_ERR  MMPH_HIF_SetInterface(void);
+//==============================================================================
+//
+//                              FUNCTIONS
+//
+//==============================================================================
+//------------------------------------------------------------------------------
+//  Function    : MMPF_SYS_TaskHandler
+//  Description : This is the SYS startup task
+//------------------------------------------------------------------------------
+void MMPF_SYS_TaskHandler(void *p_arg)
+{
+    p_arg = p_arg;
+
+    MMPF_BSP_InitializeTimer();
+
+    CreateEvents();     // Create the application's kernel objects
+#if OS_TASK_STAT_EN > 0
+    OSStatInit();
+#endif
+    CreateTasks();      // Create the other application tasks
+
+    MMPF_SYS_Task();
+}
+
+//------------------------------------------------------------------------------
+//  Function    : MMPF_LTASK_TaskHandler
+//  Description : This is the SYS startup task
+//------------------------------------------------------------------------------
+/* #pragma arm section rwdata = "EnterSelfSleepMode",  zidata = "EnterSelfSleepMode" */
+
+void MMPF_LTASK_TaskHandler(void *p_arg)
+{
+    MMPF_OS_FLAGS   flags;
+
+    RTNA_DBG_Str3("L_Task()\r\n");
+
+    while (TRUE) {
+        MMPF_OS_WaitFlags(SYS_Flag_Hif, SYS_FLAG_LTASK,
+                    MMPF_OS_FLAG_WAIT_SET_ANY | MMPF_OS_FLAG_CONSUME, 0, &flags);
+    }
+}
+/* #pragma arm section rodata, rwdata, zidata */
+
+//------------------------------------------------------------------------------
+//  Function    : CreateTasks
+//  Description : It is called by startup task to create default tasks at
+//                initialization.
+//------------------------------------------------------------------------------
+static void CreateTasks(void)
+{
+    MMPF_SWPACK_TaskInit();
+}
+
+//------------------------------------------------------------------------------
+//  Function    : CreateEvents
+//  Description : This function creates the basic system events for OS inter
+//                communication.
+//------------------------------------------------------------------------------
+static void CreateEvents(void)
+{
+    MMP_BYTE *ubFlagName = NULL;
+
+    SYS_Flag_Hif = MMPF_OS_CreateEventFlagGrp(0);
+    if (SYS_Flag_Hif >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+        ubFlagName = "SYS_Flag";
+        goto _create_flag_err;
+    }
+
+    DSC_UI_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (DSC_UI_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+        ubFlagName = "DSC_UI_Flag";
+        goto _create_flag_err;
+    }
+
+    SENSOR_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (SENSOR_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+        ubFlagName = "SNR_Flag";
+        goto _create_flag_err;
+    }
+
+    DSC_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (DSC_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+        ubFlagName = "DSC_Flag";
+        goto _create_flag_err;
+    }
+
+    AUD_REC_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (AUD_REC_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+    	ubFlagName = "AUDREC_Flag";
+        goto _create_flag_err;
+    }
+
+    VID_REC_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (VID_REC_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+    	ubFlagName = "VIDREC_Flag";
+        goto _create_flag_err;
+    }
+
+    STREAMER_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (STREAMER_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+    	ubFlagName = "STREAMER_Flag";
+        goto _create_flag_err;
+    }
+
+    OSD_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (OSD_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+    	ubFlagName = "OSD_Flag";
+        goto _create_flag_err;
+    }
+
+    #if (SUPPORT_MDTC)
+    MDTC_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (MDTC_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+    	ubFlagName = "MDTC_Flag";
+        goto _create_flag_err;
+    }
+    #endif
+
+    IPC_UI_Flag = MMPF_OS_CreateEventFlagGrp(0);
+    if (IPC_UI_Flag >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+        RTNA_DBG_Str(0, "Error:DSC_UI_Flag Failed\r\n");
+    }
+
+    return;
+
+_create_flag_err:
+    RTNA_DBG_Str0("Err: ");
+    RTNA_DBG_Str0(ubFlagName);
+    RTNA_DBG_Str0(" Failed\r\n");
+}
+
+extern unsigned char *__RESET_START__;
+extern unsigned char *__RESET_END__;
+extern unsigned char *__ALLSRAM_START__;
+extern unsigned char *__ALLSRAM_END__;
+extern unsigned char *__bss_start__;
+extern unsigned char *__bss_end__;
+
+
+
+static void bss_zero_init()
+{
+        memset(&__bss_start__, 0, (int)&__bss_end__ - (int)&__bss_start__);
+}
+
+extern unsigned int* ___FlashToItcmFlashCodeStart;
+extern unsigned int* ___FlashToItcmFlashCodeEnd;
+extern unsigned int* ___FlashToItcmRamRegionStart;
+extern unsigned int* ___FlashToDtcmFlashCodeStart;
+extern unsigned int* ___FlashToDtcmFlashCodeEnd;
+extern unsigned int* ___FlashToDtcmRamRegionStart;
+//------------------------------------------------------------------------------
+//  Function    : main
+//  Description : This is the standard entry point for C and CRT
+//                initialization is done before calling main()
+//------------------------------------------------------------------------------
+extern void AT91F_EnableICache (void);
+extern void AT91F_EnableDCache (void);
+int main(void)
+{
+
+    int ItcmSize, DtcmSize;
+    MMPF_MMU_Initialize((MMP_ULONG *)MMU_TRANSLATION_TABLE_ADDR,(MMP_ULONG *)MMU_COARSEPAGE_TABLE_ADDR);
+    ItcmSize = (int)&___FlashToItcmFlashCodeEnd - (int)&___FlashToItcmFlashCodeStart;
+    DtcmSize = (int)&___FlashToDtcmFlashCodeEnd - (int)&___FlashToDtcmFlashCodeStart;
+    memcpy(&___FlashToItcmRamRegionStart, &___FlashToItcmFlashCodeStart, ItcmSize);
+    memcpy(&___FlashToDtcmRamRegionStart, &___FlashToDtcmFlashCodeStart, DtcmSize);
+    bss_zero_init();
+
+    MMPF_TASK_CFG   task_cfg;
+    AITPS_GBL       pGBL = AITC_BASE_GBL;
+    #if (CPUB_JTAG_DEBUG == 0)
+    AITPS_CORE      pCORE = AITC_BASE_CORE;
+    #endif
+    MMP_UBYTE       i = 0;
+
+    // take care cpu-b watchdog reset
+    AITPS_WD 	pWD = AITC_BASE_WD;
+    if((pWD->WD_MODE_CTL0 & WD_EN) != 0x0)
+    {
+        MMP_ULONG ulValue = WD_CTL_ACCESS_KEY;
+        pWD->WD_MODE_CTL0 = ulValue;
+        MMPF_SYS_ResetHModule(MMPF_SYS_MDL_H264, MMP_TRUE);
+    }
+
+    // Turn on all clock
+    pGBL->GBL_CLK_EN[0] = GBL_CLK_ALL0;
+    pGBL->GBL_CLK_EN[1] = GBL_CLK_ALL1;
+
+    // For power consumption
+    #if (CPUB_JTAG_DEBUG == 0)
+    pCORE->CORE_A_CFG |= CPU_SLEEP_MODE_EN; // WFI to gate clock
+    pCORE->CORE_B_CFG |= CPU_SLEEP_MODE_EN; // WFI to gate clock
+    #endif
+    
+    #if CONFIG_HW_FOR_DRAM_TIMIMG_TEST==0
+    pGBL->GBL_CLK_DIS[0] =  GBL_CLK_RAW_F | GBL_CLK_RAW_S0 | GBL_CLK_RAW_S1 |
+                            GBL_CLK_RAW_S2 | GBL_CLK_CCIR | GBL_CLK_DSPY|
+                            GBL_CLK_HDMI | GBL_CLK_TV | GBL_CLK_SM |
+                            GBL_CLK_SD3;
+
+      #ifdef PROJECT_Q
+      pGBL->GBL_CLK_DIS[1] =  GBL_CLK_IRDA | GBL_CLK_LDC |
+                              GBL_CLK_MIPI_RX_BIST;
+      
+      #else
+      pGBL->GBL_CLK_DIS[1] =  GBL_CLK_USB | GBL_CLK_IRDA | GBL_CLK_LDC |
+                              GBL_CLK_MIPI_RX_BIST;
+      #endif
+                                
+    #endif
+    
+    MMPC_System_InitConfig();
+    MMPH_HIF_SetInterface();
+    MMPF_OS_Initialize();
+
+    MMPF_BSP_Initialize();  // Initialize BSP functions
+    MMPF_PLL_Initialize();
+
+    MMPF_DRAM_GetStackSize(&MMPS_System_GetConfig()->ulStackMemorySize);
+    MMPF_DRAM_InitSettings();
+
+    for (i = 0; i< GRP_IDX_NUM; i++){
+        SYS_Sem_Hif[i] = MMPF_OS_CreateSem(1);
+    }
+
+    // User specified data
+    // Task Table Initialization
+    //[TODO] It can do initialization at CRT if CRT exists.
+    task_cfg.ubPriority = TASK_SYS_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&SYS_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&SYS_Task_Stk[TASK_SYS_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_SYS_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (MMP_UBYTE *)"SYS");
+
+    task_cfg.ubPriority = (OS_LOWEST_PRIO - 2);
+    task_cfg.pbos = (INT32U)&LTASK_Task_Stk[0];
+    task_cfg.ptos = (INT32U)&LTASK_Task_Stk[LTASK_STK_SIZE - 1];
+    MMPF_OS_CreateTask(MMPF_LTASK_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (MMP_UBYTE *)"LTASK"); 
+
+    MMPF_OS_StartTask(); // Start multitasking (i.e. give control to uC/OS-II)
+    return 0;
+}
+
+//------------------------------------------------------------------------------
+//  Function    : __initial_stackheap
+//  Description : This is the default stack/heap initialization function
+//------------------------------------------------------------------------------
+/* #pragma import (__use_no_semihosting_swi) */
+
+#ifndef __GNUC__
+#include <rt_misc.h>
+
+extern unsigned int Load$$TCM_END$$Base;
+extern unsigned int Image$$ALL_DRAM$$ZI$$Limit;
+
+__value_in_regs struct __initial_stackheap __user_initial_stackheap(unsigned R0, unsigned SP, unsigned R2, unsigned SL)
+{
+    struct __initial_stackheap config;
+
+    config.stack_base = (unsigned int)&Load$$TCM_END$$Base; // the end address of TCM
+    config.heap_base = (unsigned int)&Image$$ALL_DRAM$$ZI$$Limit;
+
+    return config;
+}
+#endif
+
+void _sys_exit(int return_code)
+{
+
+}
+
+void _ttywrch(int ch)
+{
+
+}
+
+void __assert(const char *expr, const char *file, int line)
+{
+
+}
+
+/// @}

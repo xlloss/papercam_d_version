@@ -1,0 +1,150 @@
+//==============================================================================
+//
+//  File        : sys_task_cpub.c
+//  Description : Main entry function for CPU_B
+//  Author      : Chiket Lin
+//  Revision    : 1.0
+//
+//==============================================================================
+
+#include "includes_fw.h"
+#include "config_fw.h"
+
+#include "cpucomm.h"
+#include "cpucomm_bus.h"
+#include "dualcpu_sysflag.h"
+#include "cpu_sharemem.h"
+#include "cpucomm_if.h"
+#include "mmu.h"
+#include "mmpf_pll.h"
+#include "mmpf_wd.h"
+#include "mmpf_system.h"
+
+/** @addtogroup MMPF_CPUB
+@{
+*/
+
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+
+OS_STK CPUB_StartTask_Stk[TASK_B_SYS_STK_SIZE];
+
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+//==============================================================================
+//
+//                              FUNCTIONS
+//
+//==============================================================================
+void CpuB_SysReboot(int ms)                                  
+{
+    AITPS_GBL   pGBL 	= AITC_BASE_GBL;
+    MMP_ULONG clk_div,CLK_DIV[] = {1024, 128, 32 , 8 } ; 
+              
+    int i=0;                                                    
+    MMP_ULONG g0_slow ,rst_c_1s ,rst_c,c ;                          
+    MMPF_PLL_GetGroupFreq(0,&g0_slow );                             
+    g0_slow = g0_slow / 2 ;                                         
+    c = 0 ;                                                         
+    do {                                                            
+        clk_div = CLK_DIV[c] ;                                      
+        rst_c_1s =  g0_slow *1000 / (  clk_div * 16384 ) ; // 1 secs
+        rst_c = (rst_c_1s * ms ) / 1000 ;                           
+        printc("rst_c : %d,DIV:%d\r\n",rst_c, clk_div ) ;     
+        c++ ;                                                       
+        if(c>=3) {                                                  
+            break ;                                                 
+        }                                                           
+    }                                                               
+    while ( (rst_c > 31) || (!rst_c) ) ;                            
+    
+    MMPF_WD_SetTimeOut(rst_c, clk_div );                            
+    MMPF_WD_EnableWD(MMP_TRUE,MMP_TRUE,MMP_FALSE,0,MMP_TRUE); 
+    pGBL->GBL_BOOT_STRAP_CTL = 0x8000 | 0x40 ;
+    
+    while (1) {
+      printc("Reboot...\r\n");
+    }
+}    
+
+void tag_cpub_reboot(void)
+{
+  unsigned long *ptr = (unsigned long *)(0);
+  unsigned long oridata = ptr[5] ;
+  ptr[5] = 0x1234bbbb ;
+}
+
+
+//------------------------------------------------------------------------------
+//  Function    : CpuB_SysStartup
+//  Description : This is the SYS startup task
+//------------------------------------------------------------------------------
+void CpuB_SysStartup(void *p_arg)
+{
+extern int aitcam_is_streamer_alive(void);
+extern void tag_cpub_reboot(void);
+#define OTA_CHECK_TICK  30
+#define IPC_CHECK_TICK  5000
+
+static int ota_checked_ticks = 0;
+    int timeout=0;
+    AIT_REG_D *SHARE_REG = (AIT_REG_D *)MMP_CPUCOMM_SHARE_REG_GET();
+    /* unsigned int sq_addr; */
+    int i;
+    MMP_ULONG cpu_sr = 0 ; 
+
+    printc("cpu/ipc:wait...%d\r\n",OSTime);
+    for(i=0;i<MAX_CPU_QUEUE;i++) {
+        while  ( !*(SHARE_REG + i*2) ||  !*(SHARE_REG+(i*2) + 1) ) {
+            MMPF_OS_Sleep(1);
+            timeout++ ;
+            if( timeout >= IPC_CHECK_TICK ) {
+              printc("cpu/ipc : timeout...\r\n");
+              goto end ;
+            }
+        }
+        /* sq_addr = DRAM_NONCACHE_VA(*(SHARE_REG+(i*2) + 1)); */
+        /* rq_addr = DRAM_NONCACHE_VA(*(SHARE_REG + i*2)); */
+    }
+
+    initial_cpu_share_mem(MAX_CPU_QUEUE);
+    //printc("cpu/ipc:connected\r\n");	
+    // Initial CpuComm services for in CPU B
+    if( CpuComm_Init() != CPU_COMM_ERR_NONE )
+    {
+        printc( "Comm Failed\r\n" );
+        goto end ;
+    }
+	notify_cpux(MAX_CPU_QUEUE);
+	printc( "cpu/ipc:start...%d\r\n",OSTime );	
+
+end:	
+    while(1) {
+        MMPF_OS_Sleep(1000);
+        ota_checked_ticks++;
+        if( ota_checked_ticks == OTA_CHECK_TICK) {
+          MMP_SYS_MEM_MAP *mem_map ;
+          mem_map = (MMP_SYS_MEM_MAP *)&AITC_BASE_CPU_SAHRE->CPU_SAHRE_REG[48] ;
+          printc("#OTA flag : %x\r\n" , mem_map->ubOTAFlag );
+          if(mem_map->ubOTAFlag & OTA_CHK_RECOVER) {
+            mem_map->ubOTAFlag &= ~OTA_CHK_RECOVER ;
+            if(  !aitcam_is_streamer_alive() ) {
+              mem_map->ubOTAFlag |= OTA_SET_RECOVER ;
+              CPU_LOCK();
+              tag_cpub_reboot();
+              CpuB_SysReboot(1000);
+            }
+          } 
+        }
+    }
+}
+
+/// @}

@@ -1,0 +1,301 @@
+//==============================================================================
+//
+//  File        : sys_task.c32
+//  Description : Main entry function of system
+//  Author      : Jerry Tsao
+//  Revision    : 1.0
+//
+//==============================================================================
+
+#include "includes_fw.h"
+#include "config_fw.h"
+#include "lib_retina.h"
+
+#include "mmpf_system.h"
+#include "ait_config.h"
+#include "mmp_reg_gbl.h"
+
+#include "mmpf_pll.h"
+#include "mmpf_dram.h"
+#include "mmp_reg_wd.h"
+
+/** @addtogroup MMPF_SYS
+@{
+*/
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+
+// System Task Stack 
+OS_STK          SYS_Task_Stk[TASK_SYS_STK_SIZE];
+
+// System Event
+MMPF_OS_FLAGID  SYS_Flag_Hif;
+
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+void        MMPF_SYS_Task(void);
+static void CreateTasks(void);
+static void CreateEvents(void);
+extern void MMPF_SWPACK_TaskInit(void);
+
+extern unsigned char *__bss_start__;
+extern unsigned char *__bss_end__;
+
+
+static void bss_zero_init()
+{
+        memset(&__bss_start__, 0, (int)&__bss_end__ - (int)&__bss_start__);
+}
+
+
+extern unsigned int* ___FlashToItcmFlashCodeStart;
+extern unsigned int* ___FlashToItcmFlashCodeEnd;
+extern unsigned int* ___FlashToItcmRamRegionStart;
+extern unsigned int* ___FlashToDtcmFlashCodeStart;
+extern unsigned int* ___FlashToDtcmFlashCodeEnd;
+extern unsigned int* ___FlashToDtcmRamRegionStart;
+
+void dump_data(volatile char *data,int size)
+{
+    MMP_ULONG i;
+    for(i = 0; i < size; i++) {
+        if( i && !( i & 15 )) {
+            RTNA_DBG_Str(0, "\r\n");    
+        }
+        RTNA_DBG_Byte(0, data[i]);
+    }
+    RTNA_DBG_Str(0, "\r\n");
+}
+
+
+
+
+//==============================================================================
+//
+//                              MACRO DEFINITIONS
+//
+//==============================================================================
+
+//==============================================================================
+//
+//                              FUNCTIONS
+//
+//==============================================================================
+//------------------------------------------------------------------------------
+//  Function    : MMPF_SYS_TaskHandler
+//  Description : This is the SYS startup task
+//------------------------------------------------------------------------------
+void MMPF_SYS_TaskHandler(void *p_arg)
+{
+    p_arg = p_arg;
+
+    MMPF_BSP_InitializeTimer();
+
+    CreateEvents();     // Create the application's kernel objects
+    CreateTasks();      // Create the other application tasks
+
+    MMPF_SYS_Task();
+}
+
+//------------------------------------------------------------------------------
+//  Function    : CreateTasks
+//  Description : It is called by startup task to create default tasks at
+//                initialization.
+//------------------------------------------------------------------------------	
+static void CreateTasks(void)
+{
+    MMPF_SWPACK_TaskInit();
+}
+
+//------------------------------------------------------------------------------
+//  Function    : CreateEvents
+//  Description : This function creates the basic system events for OS inter
+//                communication.
+//------------------------------------------------------------------------------
+static void CreateEvents(void)
+{
+    SYS_Flag_Hif = MMPF_OS_CreateEventFlagGrp(0);
+    if (SYS_Flag_Hif >= MMPF_OS_CREATE_FLAG_EXCEED_MAX) {
+    	RTNA_DBG_Str(0, "Error:SYS_Flag_Hif Failed\r\n");
+    }
+}
+
+// AIT : GPIO 41 output high
+// QD  : GPIO 44  output high
+static void PowerOnHold(void)
+{
+    #if GPIO_MAP==AIT_EVB_GPIO_MAP
+    *(volatile MMP_UBYTE *)0x80006945 |= 0x02;
+    *(volatile MMP_UBYTE *)0x80006605 |= 0x02;
+    *(volatile MMP_UBYTE *)0x80006615 |= 0x02;
+    #endif
+    #if GPIO_MAP==QD_EVB_GPIO_MAP
+    #endif
+}
+
+static void PowerOnReadKeys(void)
+{
+#define PWR_KEY        (1<<3) // NA(AIT) MMP_GPIO40(QD)
+#define PIR_KEY        (1<<0) // MMP_GPIO56(AIT) MMP_GPIO58(QD)
+#define DOORBELL_KEY   (1<<2) // MMP_GPIO57(AIT) MMP_GPIO59(QD)
+#define WIFI_KEY       (1<<4) // NA(AIT) MMP_GPIO42(QD) 
+// RTC GPIO wake - up is for evaluation only now, can't used in formal release
+#define RTC_KEY        (0)    // (1<<6) // MMP_GPIO43(AIT) NA(QD) , 
+
+    volatile MMP_UBYTE *ptr = (volatile MMP_UBYTE *)(&AITC_BASE_CPU_IPC->CPU_IPC[4]);
+    MMP_UBYTE val1,val2,val3;
+
+    ptr[0] = ptr[1] = 0x00 ;
+
+    
+    #if GPIO_MAP == AIT_EVB_GPIO_MAP
+   // *(volatile MMP_UBYTE *)0x80006945 |= 0x05;
+    *(volatile MMP_UBYTE *)0x80006947 |= 0x03;
+
+   // *(volatile MMP_UBYTE *)0x80006605 &=~0x05;
+    *(volatile MMP_UBYTE *)0x80006607 &=~0x03;
+    
+   // val1 = *(volatile MMP_UBYTE *)0x80006615 ;
+    val2 = *(volatile MMP_UBYTE *)0x80006617 ;
+    
+   // if( !(val1 & 0x01) ) ptr[0] |= PWR_KEY ;
+   // if( !(val1 & 0x04) ) ptr[0] |= WIFI_KEY ;
+
+    if( !(val2 & 0x01) ) ptr[0] |= PIR_KEY ;
+    if( !(val2 & 0x02) ) ptr[0] |= DOORBELL_KEY ;
+
+    #if SUPPORT_RTC
+    *(volatile MMP_UBYTE *)0x80006945 |= 0x08;
+    *(volatile MMP_UBYTE *)0x80006605 &=~0x08;
+    val3 = *(volatile MMP_UBYTE *)0x80006615;
+    if( !(val3 & 0x08) ) ptr[0] |= RTC_KEY ;
+    #endif
+    
+    #endif
+    
+    #if GPIO_MAP == QD_EVB_GPIO_MAP
+    ptr[0] |= PIR_KEY ;
+    #endif
+    
+    #if 0 // def PROJECT_LD // don't pull GPIO30 here until bug fixed
+    
+    if( ptr[0] & PIR_KEY ) {
+    
+    }
+    else {
+      // Early pull high GPIO30 to wakeup MT7682
+      *(volatile MMP_UBYTE *)0x80006943 |= 0x40;
+      *(volatile MMP_UBYTE *)0x80006603 |= 0x40;
+      *(volatile MMP_UBYTE *)0x80006613 |= 0x40; 
+    } 
+    
+    #endif
+}
+
+static void PowerOnCustomer(void)
+{
+#if SUPPORT_CG5162
+//extern void ALS_Init(int preread) ;
+//  ALS_Init(1) ;
+#endif
+
+}
+
+//------------------------------------------------------------------------------
+//  Function    : main
+//  Description : This is the standard entry point for C and CRT
+//                initialization is done before calling main()
+//------------------------------------------------------------------------------
+extern void AT91F_EnableICache(void);
+int main (void)
+{
+    int ItcmSize, DtcmSize;
+    AT91F_EnableICache();
+    ItcmSize = (int)&___FlashToItcmFlashCodeEnd - (int)&___FlashToItcmFlashCodeStart;
+    DtcmSize = (int)&___FlashToDtcmFlashCodeEnd - (int)&___FlashToDtcmFlashCodeStart;
+    memcpy(&___FlashToItcmRamRegionStart, &___FlashToItcmFlashCodeStart, ItcmSize);
+    memcpy(&___FlashToDtcmRamRegionStart, &___FlashToDtcmFlashCodeStart, DtcmSize);
+    bss_zero_init(); 
+
+    MMPF_TASK_CFG   task_cfg;
+    AITPS_WD 	pWD = AITC_BASE_WD;
+
+    if((pWD->WD_MODE_CTL0 & WD_EN) != 0x0)
+    {
+        MMP_ULONG ulValue = WD_CTL_ACCESS_KEY;
+        pWD->WD_MODE_CTL0 = ulValue;
+        MMPF_SYS_ResetHModule(MMPF_SYS_MDL_H264, MMP_TRUE);
+    }
+
+    //
+    // Demo for PWR / PIR / DOORBELL / WIFI scenarios
+    //
+    PowerOnHold();
+    PowerOnReadKeys();
+
+    MMPC_System_InitConfig();
+    MMPF_OS_Initialize();
+
+    MMPF_BSP_Initialize();  // Initialize BSP functions
+    MMPF_PLL_Initialize();
+
+    PowerOnCustomer();
+    // User specified data
+    // Task Table Initialization
+    task_cfg.ubPriority = TASK_SYS_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&SYS_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&SYS_Task_Stk[TASK_SYS_STK_SIZE-1];
+    MMPF_OS_CreateTask(MMPF_SYS_TaskHandler, &task_cfg, (void *)0);
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (MMP_UBYTE *)"SYS");
+
+    MMPF_OS_StartTask(); // Start multitasking (i.e. give control to uC/OS-II)
+    return 0;
+}
+
+//------------------------------------------------------------------------------
+//  Function    : __initial_stackheap
+//  Description : This is the default stack/heap initialization function
+//------------------------------------------------------------------------------
+#ifndef __GNUC__
+#pragma import (__use_no_semihosting_swi)
+
+#include <rt_misc.h>
+
+extern unsigned int Load$$TCM_END$$Base;
+extern unsigned int Image$$ALL_DRAM$$ZI$$Limit;
+
+__value_in_regs struct __initial_stackheap
+__user_initial_stackheap(unsigned R0, unsigned SP, unsigned R2, unsigned SL)
+{
+    struct __initial_stackheap config;
+
+    config.stack_base = (unsigned int)&Load$$TCM_END$$Base; // the end address of TCM
+    config.heap_base = (unsigned int)&Image$$ALL_DRAM$$ZI$$Limit;
+
+    return config;
+}
+#endif
+
+void _sys_exit(int return_code)
+{
+
+}
+
+void _ttywrch(int ch)
+{
+
+}
+
+void __assert(const char *expr, const char *file, int line)
+{
+}
+
+/// @}

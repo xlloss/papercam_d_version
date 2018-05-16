@@ -1,0 +1,3904 @@
+/// @ait_only
+
+//==============================================================================
+//
+//                              INCLUDE FILE
+//
+//==============================================================================
+
+#include "mmp_lib.h"
+#include "mmpf_system.h"
+#include "mmph_hif.h"
+#include "ait_bsp.h"
+#include "ait_utility.h"
+#include "mmp_reg_dram.h"
+#include "mmp_reg_gbl.h"
+#include "mmpf_dram.h"
+#include "mmp_reg_pad.h"
+#include "lib_retina.h"
+#include "mmp_reg_mci.h"
+#if (AUTO_DRAM_LOCKCORE)&&(defined(MBOOT_FW)||defined(UPDATER_FW))
+#include "mmp_reg_dma.h"
+#endif
+
+/** @addtogroup MMPF_System
+ *  @{
+ */
+
+//==============================================================================
+//
+//                              CONSTANTS
+//
+//==============================================================================
+
+#define SEARCH_DLY_LOWBD        (0x00)
+#if (DRAM_ID == DRAM_DDR)
+#define SEARCH_DLY_UPBD         (0x200)
+#define SEARCH_DLY_STEP         (32)
+#define SEARCH_DLY_SUB_STEP     (16)
+#endif
+#if (DRAM_ID == DRAM_DDR2)||(DRAM_ID == DRAM_DDR3)
+#define SEARCH_DLY_UPBD         (0x100)
+#define SEARCH_DLY_STEP         (16)
+#endif
+#define SEARCH_EARLY_STOP       (0)
+#define SEARCH_DQDLY_NUM        (48)
+
+#define USE_LGT_DDR3_SETTING    (1)
+
+//==============================================================================
+//
+//                              STRUCTURES
+//
+//==============================================================================
+
+typedef struct _MMPF_DRAM_DMA_PARAM {
+    MMP_ULONG ulSrcAddr;
+    MMP_ULONG ulDstAddr;
+    MMP_ULONG ulSize;
+} MMPF_DRAM_DMA_PARAM;
+
+#if DDR3_Q_PATCH>=2
+typedef struct _DDR3_SCANRANGE_INFO {
+    MMP_ULONG   ulSkipScan ;
+    MMP_USHORT  usTriangle ;
+    MMP_USHORT  usBestAsyncRd ;
+    MMP_USHORT  usBestDLY ;
+    MMPF_DRAM_CHKDLYINFO upper,down ;
+        
+        
+} DDR3_SCANRANGE_INFO ;
+#endif
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+
+/* #pragma arm section code = "EnterSelfSleepMode", rwdata = "EnterSelfSleepMode",  zidata = "EnterSelfSleepMode" */
+MMP_UBYTE       m_dramVender;
+MMP_UBYTE       m_dramSize;
+MMPF_DRAM_TYPE  m_dramtype = MMPF_DRAM_TYPE_NONE;
+MMPF_DRAM_MODE  m_dramMode = MMPF_DRMA_MAX_MODE;
+MMP_UBYTE       m_dramClkSrc;
+MMP_ULONG       m_dramClock;
+/* #pragma arm section code, rwdata,  zidata */
+
+#if (AUTO_DRAM_LOCKCORE)&&(defined(MBOOT_FW)||defined(UPDATER_FW))
+/* #pragma arm section code = "RESETMCI", rwdata = "RESETMCI",  zidata = "RESETMCI" */
+/*static*/ OS_CPU_SR    cpu_sr __attribute__((section(".RESETMCIdata"))) ;
+/*static*/ AITPS_GBL    m_pGBL __attribute__((section(".RESETMCIdata"))) = AITC_BASE_GBL;
+/* #pragma arm section code, rwdata,  zidata */
+
+static MMP_DRAM_CLK_DLY_SET m_delayTable[] = {
+    { 10, 0xE0}, { 20, 0xE0}, { 30, 0xD0}, { 40, 0x6A},
+    { 45, 0x6C}, { 48, 0x6E}, {166, 0x52}, {180, 0x40},
+    {192, 0x38}, {195, 0x32}, {198, 0x32}, {200, 0x32},
+    {204, 0x32}, {300, 0x32}, {400, 0x32}, {528, 0x28},
+    {533, 0x28}
+};
+
+#if defined(MBOOT_FW)
+static void DRAM_Reset(MMP_USHORT usDelay) ITCMFUNC;
+static MMP_BOOL DMA_CopyDramTest(MMP_ULONG src_addr, MMP_ULONG dst_addr, MMP_USHORT src_off, MMP_USHORT dst_off, MMP_ULONG length) ITCMFUNC;
+static MMP_BOOL DMA_DramVerify(void) ITCMFUNC;
+extern unsigned char* __RESET_START__;
+extern unsigned char* __RESET_END__;
+#endif
+#if defined(UPDATER_FW)
+extern unsigned int Image$$ALL_SRAM$$Base;
+extern unsigned int Image$$ALL_SRAM$$ZI$$Limit;
+#endif
+#endif
+
+MMP_USHORT m_usDramSizeTable[8] = 
+{
+	32, 64, 16, 64, 16, 64, 128, 128
+};
+
+#if (AUTO_DRAM_LOCKCORE)
+static MMPF_DRAM_DMA_PARAM m_DmaParam;
+#if (DRAM_ID == DRAM_DDR2)||(DRAM_ID == DRAM_DDR3)
+static MMPF_DRAM_CHKDLYINFO ChkDlyInfo[SEARCH_DQDLY_NUM];
+static DDR3_USER_SETTING DDR3Setting ;
+static MMP_BOOL InvalidDDR3Test = MMP_FALSE ;
+
+#endif
+#endif // (AUTO_DRAM_LOCKCORE)
+
+#if DDR3_Q_PATCH
+MMP_UBYTE       ubTriangleArea = 0; //0=default 1=left up traingle 2=right down triangle
+
+#if DDR3_Q_PATCH >= 2
+DDR3_SCANRANGE_INFO gNewScanRangeTable ;
+#endif
+
+#endif
+
+OS_CPU_SR OS_CPU_SR_Save_forThumb(void)               
+{                                                     
+                                                          
+       return OS_CPU_SR_Save();                           
+}                                                     
+                                                      
+void OS_CPU_SR_Restore_forThumb(OS_CPU_SR cpu_sr)     
+{                                                     
+        OS_CPU_SR_Restore(cpu_sr);                        
+                                                              
+}                                                     
+
+
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+MMP_ERR MMPF_DRAM_ZQCalibration(void);
+MMP_ERR MMPF_DRAM_WRLVLCalibration(void);
+MMP_ERR MMPF_DRAM_GateTrainingCalibration(void);
+
+//==============================================================================
+//
+//                              FUNCTIONS
+//
+//==============================================================================
+
+#if defined(MBOOT_FW)||defined(UPDATER_FW)
+
+#if 0
+void _____DDR_MODE_____(){}
+#endif 
+//*----------------------------------------------------------------------------
+//* Function Name       : MMPF_DRAM_Initialize
+//* Input Parameters    : none
+//* Output Parameters   : none
+//* Functions called    : Initial Dram
+//*----------------------------------------------------------------------------
+/** @brief Initialize the DRAM and report the DRAM size
+
+@return A predefined DRAM size in bytes.
+*/
+#if (DRAM_ID == DRAM_DDR)
+MMP_ERR MMPF_DRAM_Initialize(MMPF_DRAM_TYPE dramtype, MMP_ULONG *ulSize, MMP_ULONG ulClock, MMPF_DRAM_MODE drammode)
+{
+	//AITPS_GBL pGBL = AITC_BASE_GBL;
+	AITPS_DRAM_DDR3 pDDR3 = AITC_BASE_DDR3;
+	AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	AITPS_MCI  pMCI  = AITC_BASE_MCI;
+	MMP_ULONG  uldramsize = 0;
+	
+	MMPF_SYS_ResetHModule(MMPF_SYS_MDL_DRAM, MMP_FALSE);
+	MMPF_DRAM_ConfigPad(MMP_FALSE);
+	
+	//MCI bypass dram queue
+	pMCI->MCI_EXTM_TYPE   = MCI_EXTM_DRAM;      // 0x7710
+	pMCI->MCI_FB_DRAM_CTL = MCI_RD_AFTER_WR_EN; // 0x7711
+	//------------------------------------------------
+	
+	MMPF_DRAM_GetStackSize(&uldramsize);
+	*ulSize = uldramsize;
+	
+	if (uldramsize == 128*1024*1024) {
+		pDRAM->DRAM_CTL_0 = (DDR_MODE | BANK_SIZE_4M | DRAM_CAS_LATENCY_3);//6E10 reference dram setting table
+		pDRAM->DRAM_DDR_DQPLK_PD_CTL = (DRAM_DQBLK_DDR_MODE | DRAM_DQBLK_NML_OPT);//6E61
+		pDRAM->DRAM_DDR_DDR2_OPR_CTL = DRAM_DDR_BOTCLK_EN | DRAM_DDR_BOTCLK_DDR_MODE;//6E72
+		pDRAM->DRAM_CTL_1 = (DRAM_BUS_32 | DRAM_LOAD_MODE_FIRST | DRAM_BANK_INTLV);//6E11
+		pDRAM->DRAM_CTL_2 = (DRAM_COL_1024 | DRAM_ROW_8192);//6E12 reference dram setting table
+		
+		pDRAM->DRAM_FUNC = DRAM_NA_EN | DRAM_CLK_GATE_EN |
+							DRAM_ARF_EN | DRAM_APD_EN/* | DRAM_PMP_EN */| DRAM_SPRE_EN | DRAM_EH_SPRE_EN;// 6e18 6e19
+		
+        pDRAM->DRAM_SIGNAL_CTL = (DRAM_CYC_DLY_EN /*| DRAM_CLK_OUT_INV_EN*/);//6e1a must tune
+	
+		switch(ulClock) {
+			case 200:
+	            RTNA_DBG_Str(0, "DDR 200\r\n");
+	            pDRAM->DRAM_ARF_CYC = 374;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(10)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(14) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(23) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(2);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				pDRAM->DRAM_CTL_CYC_1 |= DRAM_TRTP_CYC(0); // 6E24
+				break;
+			case 192:
+	            RTNA_DBG_Str(0, "DDR 192\r\n");
+	            pDRAM->DRAM_ARF_CYC = 359;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(10)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(13) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(23) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(2);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				pDRAM->DRAM_CTL_CYC_1 |= DRAM_TRTP_CYC(0); // 6E24
+				break;	
+			case 180:
+	            RTNA_DBG_Str(0, "DDR 180\r\n");
+	            pDRAM->DRAM_ARF_CYC = 335;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(9)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(12) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(21) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(2);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				pDRAM->DRAM_CTL_CYC_1 |= DRAM_TRTP_CYC(0); // 6E24
+				break;		
+			case 100:
+	            RTNA_DBG_Str(0, "DDR 100\r\n");
+	            pDRAM->DRAM_ARF_CYC = 179;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(3) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(5)  | 	
+									DRAM_TRCD_CYC(1) |
+									DRAM_TRFC_CYC(7) |
+									DRAM_TRP_CYC(1)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(11) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(1);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				pDRAM->DRAM_CTL_CYC_1 |= DRAM_TRTP_CYC(0); // 6E24
+				break;
+			case 40:
+	            RTNA_DBG_Str(0, "DDR 40\r\n");
+	            pDRAM->DRAM_ARF_CYC = 62;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(1) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(2)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(2) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(4) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				pDRAM->DRAM_CTL_CYC_1 |= DRAM_TRTP_CYC(0); // 6E24
+				break;	
+			case 20:
+	            RTNA_DBG_Str(0, "DDR 20\r\n");
+	            pDRAM->DRAM_ARF_CYC = 23;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(0) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(1)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(1) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(2) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				pDRAM->DRAM_CTL_CYC_1 |= DRAM_TRTP_CYC(0); // 6E24
+				break;							
+			default:
+				RTNA_DBG_Str(0, "Un-supported DRAM ulClock !\r\n");
+	   			return 1;
+	   			break;	
+		};
+	}	
+	else if (uldramsize == 64*1024*1024) {
+		pDRAM->DRAM_CTL_0 = (DDR_MODE | BANK_SIZE_4M | DRAM_CAS_LATENCY_3);//6E10 reference dram setting table
+		pDRAM->DRAM_DDR_DQPLK_PD_CTL = (DRAM_DQBLK_DDR_MODE | DRAM_DQBLK_NML_OPT);//6E61
+		pDRAM->DRAM_DDR_DDR2_OPR_CTL = DRAM_DDR_BOTCLK_EN | DRAM_DDR_BOTCLK_DDR_MODE;//6E72
+		pDRAM->DRAM_CTL_1 = (DRAM_BUS_32 | DRAM_LOAD_MODE_FIRST | DRAM_BANK_INTLV);//6E11
+		pDRAM->DRAM_CTL_2 = (DRAM_COL_512 | DRAM_ROW_8192);//6E12 reference dram setting table
+		
+		pDRAM->DRAM_FUNC = DRAM_NA_EN | DRAM_CLK_GATE_EN |
+							DRAM_ARF_EN | DRAM_APD_EN/* | DRAM_PMP_EN */| DRAM_SPRE_EN | DRAM_EH_SPRE_EN;// 6e18 6e19
+
+		//pDRAM->DRAM_SIGNAL_CTL = DRAM_CYC_DLY_EN;//6e1a must tune, follow derek's setting
+	   	pDRAM->DRAM_SIGNAL_CTL = (DRAM_CYC_DLY_EN /*| DRAM_CLK_OUT_INV_EN*/);//6e1a must tune
+	
+		switch(ulClock) {
+			case 200:
+	            RTNA_DBG_Str(0, "DDR 200\r\n");
+	            pDRAM->DRAM_ARF_CYC = 766;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(10)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(14) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(23) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(1);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				break;
+			case 192:
+	            RTNA_DBG_Str(0, "DDR 192\r\n");
+	            pDRAM->DRAM_ARF_CYC = 734;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(10)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(13) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(23) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(1);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				break;	
+			case 180:
+	            RTNA_DBG_Str(0, "DDR 180\r\n");
+	            pDRAM->DRAM_ARF_CYC = 688;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(9)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(12) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(21) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(1);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				break;		
+			case 100:
+	            RTNA_DBG_Str(0, "DDR 100\r\n");
+	            pDRAM->DRAM_ARF_CYC = 375;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(3) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(5)  | 	
+									DRAM_TRCD_CYC(1) |
+									DRAM_TRFC_CYC(7) |
+									DRAM_TRP_CYC(1)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(11) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				break;
+			case 45:
+	            RTNA_DBG_Str(0, "DDR 45\r\n");
+	            pDRAM->DRAM_ARF_CYC = 160;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(1) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(2)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(3) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(5) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				break;		
+			case 40:
+	            RTNA_DBG_Str(0, "DDR 40\r\n");
+	            pDRAM->DRAM_ARF_CYC = 141;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(1) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(2)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(2) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(4) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				break;	
+			case 30:
+	            RTNA_DBG_Str(0, "DDR 30\r\n");
+	            pDRAM->DRAM_ARF_CYC = 102;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(1) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(1)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(2) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(3) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				break;	
+			case 20:
+	            RTNA_DBG_Str(0, "DDR 20\r\n");
+	            pDRAM->DRAM_ARF_CYC = 63;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(0) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(1)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(1) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(2) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(0);//ret dram setting 6E25
+				break;							
+			default:
+				RTNA_DBG_Str(0, "Un-supported DRAM ulClock !\r\n");
+	   			return 1;
+	   			break;	
+		};
+	}	
+	else if (uldramsize == 32*1024*1024) {
+		pDRAM->DRAM_CTL_0 = (DDR_MODE | BANK_SIZE_4M | DRAM_CAS_LATENCY_3);//6E10 reference dram setting table
+		pDRAM->DRAM_DDR_DQPLK_PD_CTL = (DRAM_DQBLK_DDR_MODE | DRAM_DQBLK_NML_OPT);//6E61
+		pDRAM->DRAM_DDR_DDR2_OPR_CTL = DRAM_DDR_BOTCLK_EN | DRAM_DDR_BOTCLK_DDR_MODE;//6E72
+		pDRAM->DRAM_CTL_1 = (DRAM_BUS_32 | DRAM_LOAD_MODE_FIRST | DRAM_BANK_INTLV);//6E11
+		pDRAM->DRAM_CTL_2 = (DRAM_COL_512 | DRAM_ROW_4096);//6E12 reference dram setting table
+		
+		pDRAM->DRAM_FUNC = DRAM_NA_EN | DRAM_CLK_GATE_EN |
+							DRAM_ARF_EN | DRAM_APD_EN/* | DRAM_PMP_EN */| DRAM_SPRE_EN | DRAM_EH_SPRE_EN;// 6e18 6e19
+
+		//pDRAM->DRAM_SIGNAL_CTL = DRAM_CYC_DLY_EN;//6e1a must tune, follow derek's setting
+	   	pDRAM->DRAM_SIGNAL_CTL = (DRAM_CLK_OUT_INV_EN /*| DRAM_CLK_OUT_INV_EN*/);//6e1a must tune // Change to inverse for bigger continue range.	
+	
+		switch(ulClock) {
+			case 200:
+	            RTNA_DBG_Str(0, "DDR 200\r\n");
+	            pDRAM->DRAM_ARF_CYC = 3109;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(10)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(15) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(15) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(2);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1);//ret dram setting 6E25
+				break;
+			case 192:
+	            RTNA_DBG_Str(0, "DDR 192\r\n");
+	            pDRAM->DRAM_ARF_CYC = 2984;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(10)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(15) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(15) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(2);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1);//ret dram setting 6E25
+				break;	
+			case 180:
+	            RTNA_DBG_Str(0, "DDR 180\r\n");
+	            pDRAM->DRAM_ARF_CYC = 2797;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(9)  | 	
+									DRAM_TRCD_CYC(2) |
+									DRAM_TRFC_CYC(14) |
+									DRAM_TRP_CYC(2)  |
+									DRAM_TRRD_CYC(1) |
+									DRAM_TXSR_CYC(14) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(2);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1);//ret dram setting 6E25
+				break;		
+			case 100:
+	            RTNA_DBG_Str(0, "DDR 100\r\n");
+	            pDRAM->DRAM_ARF_CYC = 1547;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(3) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(5)  | 	
+									DRAM_TRCD_CYC(1) |
+									DRAM_TRFC_CYC(7) |
+									DRAM_TRP_CYC(1)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(7) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(1);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1);//ret dram setting 6E25
+				break;
+			case 45:
+	            RTNA_DBG_Str(0, "DDR 45\r\n");
+	            pDRAM->DRAM_ARF_CYC = 688;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(1) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(2)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(3) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(3) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1);//ret dram setting 6E25
+				break;		
+			case 40:
+	            RTNA_DBG_Str(0, "DDR 40\r\n");
+	            pDRAM->DRAM_ARF_CYC = 609;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(1) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(2)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(3) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(3) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1);//ret dram setting 6E25
+				break;	
+			case 30:
+	            RTNA_DBG_Str(0, "DDR 30\r\n");
+	            pDRAM->DRAM_ARF_CYC = 453;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(1) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(1)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(2) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(2) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1);//ret dram setting 6E25
+				break;	
+			case 20:
+	            RTNA_DBG_Str(0, "DDR 20\r\n");
+	            pDRAM->DRAM_ARF_CYC = 297;//6E1C 6E1D
+		   		pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(0) |	//ret dram setting 6E20~6E23
+									DRAM_TRC_CYC(1)  | 	
+									DRAM_TRCD_CYC(0) |
+									DRAM_TRFC_CYC(1) |
+									DRAM_TRP_CYC(0)  |
+									DRAM_TRRD_CYC(0) |
+									DRAM_TXSR_CYC(1) |
+									DRAM_TMRD_CYC(1));
+
+				pDRAM->DRAM_CTL_CYC_1 = DRAM_TWR_CYC(0);//ret dram setting 6E24
+				pDRAM->DRAM_CTL_CYC_DDR |= DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1);//ret dram setting 6E25
+				break;							
+			default:
+				RTNA_DBG_Str(0, "Un-supported DRAM ulClock !\r\n");
+	   			return 1;
+	   			break;	
+		};
+	}	
+	else {
+		RTNA_DBG_Str(0, "Un-supported DRAM size !\r\n");
+	   	return 1;
+	}
+
+	RTNA_DBG_Str3("send dram init cmd\r\n");
+	if (ulClock < 40) {
+		pDRAM->DRAM_DQBLK0_RD_QCDL_CTL = 0xFF;
+	    pDRAM->DRAM_DQBLK0_WR_QCDL_CTL = 0xFF;
+	    pDRAM->DRAM_DQBLK1_RD_QCDL_CTL = 0xFF;
+	    pDRAM->DRAM_DQBLK1_WR_QCDL_CTL = 0xFF;
+	    pDRAM->DRAM_DQBLK2_RD_QCDL_CTL = 0xFF;
+	    pDRAM->DRAM_DQBLK2_WR_QCDL_CTL = 0xFF;
+	    pDRAM->DRAM_DQBLK3_RD_QCDL_CTL = 0xFF;
+	    pDRAM->DRAM_DQBLK3_WR_QCDL_CTL = 0xFF;
+	    pDRAM->DRAM_DQBLK_0_1_W_R_QCDL_RDAS_CTL_HIGH_BIT |= 0x45;
+	    pDRAM->DRAM_DQBLK_1_2_W_R_QCDL_RDAS_CTL_HIGH_BIT |= 0x51;
+	    pDRAM->DRAM_DQBLK_2_3_W_R_QCDL_RDAS_CTL_HIGH_BIT |= 0x14;
+	    
+	    pDRAM->DRAM_DDR_DLL1_CTL |= 0x01;
+	}
+
+	#if (AUTO_DLL_LOCK == 1)
+	pDRAM->DRAM_DDR_DLL_REST_LB_CTL |= 0x02;   // 0x6e60
+	MMPF_OS_Sleep(10);
+	pDRAM->DRAM_DDR_DLL_REST_LB_CTL &=~ 0x02;  // 0x6e60
+	MMPF_OS_Sleep(10);
+	#endif
+
+	pDRAM->DRAM_DDR_CLK_MACRO_DLY = 0x20;//6e70
+
+	#if 1  //Async DQ setting 1
+	pDRAM->DRAM_DFI_CTL = 0x09;//6E1B
+	pDRAM->DRAM_DDR_DDR2_RD_DLY = 0x01;//6E1F
+	
+	pDRAM->DRAM_DDR_DQBLK0_CTL0 = 0x04;//6E92
+	pDRAM->DRAM_DDR_DQBLK1_CTL0 = 0x04;//6E97
+	pDRAM->DRAM_DDR_DQBLK2_CTL0 = 0x04;//6E9C
+	pDRAM->DRAM_DDR_DQBLK3_CTL0 = 0x04;//6EA1
+	
+	pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0x2C;//6E91
+	pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0x2C;//6E96
+	pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0x2C;//6E9B
+	pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0x2C;//6EA0
+	
+	pDRAM->DRAM_DDR_DQBLK0_PAD_CTL_OPT = 0x70; // 6E94
+	pDRAM->DRAM_DDR_DQBLK1_PAD_CTL_OPT = 0x70; // 6E99
+	pDRAM->DRAM_DDR_DQBLK2_PAD_CTL_OPT = 0x70; // 6E9E
+	pDRAM->DRAM_DDR_DQBLK3_PAD_CTL_OPT = 0x70; // 6EA3
+	
+	pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = 0xA0; // 6E90
+	pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = 0xA0; // 6E95
+	pDRAM->DRAM_DDR_DQBLK2_SYNC_DLY_TUNE = 0xA0; // 6E9A
+	pDRAM->DRAM_DDR_DQBLK3_SYNC_DLY_TUNE = 0xA0; // 6E9F
+
+	// increase scan range
+	// cmd delay
+	pDRAM->DRAM_ARF_QUEUE_DEPTH   |= 0x10; // 0x6E1E
+	// WR delay
+	pDDR3->DRAM_RD_WRLVL_DBG_EN   = 0x01; // 30f0
+	pDDR3->DRAM_DQ0_WRLVL_DLY_OPR = 0x40;//30f4
+	pDDR3->DRAM_DQ1_WRLVL_DLY_OPR = 0x40;//30f5
+	pDDR3->DRAM_DQ2_WRLVL_DLY_OPR = 0x40;//30f6
+	pDDR3->DRAM_DQ3_WRLVL_DLY_OPR = 0x40;//30f7
+
+	pDRAM->DRAM_BOTTOM_DDR_CLK_MACRO_CLK_CTL = 0x70; // 6EA5
+	#endif
+
+   	MMPF_DRAM_SendInitCmd();
+
+	//RTNA_DBG_Str(0, "Init DRAM done!\r\n");
+	RTNA_DBG_Str(0, "Lock Code:");
+	RTNA_DBG_Byte(0, pDRAM->DRAM_DQBLK0_RD_QCDL_CTL);
+	RTNA_DBG_Str(0, "\r\n");
+    return MMP_ERR_NONE;
+}
+#endif
+
+#if 0 // for IDE function name list by section
+void _____DDR2_MODE_____(){}
+#endif 
+#if (DRAM_ID == DRAM_DDR2)
+MMP_ERR MMPF_DRAM_Initialize(MMPF_DRAM_TYPE dramtype, MMP_ULONG *ulSize, MMP_ULONG ulClock, MMPF_DRAM_MODE drammode)
+{
+	AITPS_DRAM_DDR3 pDDR3 = AITC_BASE_DDR3;
+	AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	AITPS_MCI  pMCI  = AITC_BASE_MCI;
+	
+	MMPF_SYS_ResetHModule(MMPF_SYS_MDL_DRAM, MMP_FALSE);
+	MMPF_DRAM_ConfigPad(MMP_FALSE);
+	
+	//MCI bypass dram queue
+	pMCI->MCI_EXTM_TYPE   = MCI_EXTM_DRAM;      // 0x7710
+	pMCI->MCI_FB_DRAM_CTL = MCI_RD_AFTER_WR_EN; // 0x7711
+	//------------------------------------------------
+	
+	pDRAM->DRAM_CTL_0 = (DDR2_MODE | BANK_SIZE_8M | DRAM_CAS_LATENCY_3);//6E10 reference dram setting table
+	//pDRAM->DRAM_CTL_0 = (DDR2_MODE | BANK_SIZE_8M | DRAM_CAS_LATENCY_5);//6E10 reference dram setting table
+	pDRAM->DRAM_CTL_1 = DRAM_BUS_16; // 6E11
+	pDRAM->DRAM_CTL_2 = (DRAM_COL_1024 | DRAM_ROW_8192);//6E12 reference dram setting table
+    //pDRAM->DRAM_FUNC = DRAM_NA_EN /*| DRAM_CLK_GATE_EN */|
+	//					DRAM_ARF_EN /*| DRAM_APD_EN*//* | DRAM_PMP_EN */| DRAM_SPRE_EN | DRAM_EH_SPRE_EN;// 6e18 6e19	
+
+	//pDRAM->DRAM_SIGNAL_CTL = DRAM_CYC_DLY_EN;//6e1a must tune, follow derek's setting
+   	pDRAM->DRAM_SIGNAL_CTL = (DRAM_CYC_DLY_EN /*| DRAM_CLK_OUT_INV_EN*/);//6e1a must tune
+	
+	switch(ulClock) {
+		case 400:		
+			pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(7) | DRAM_TRC_CYC(10) |
+									 DRAM_TRCD_CYC(2) | DRAM_TRFC_CYC(25) | 
+									 DRAM_TRP_CYC(2) | DRAM_TRRD_CYC(1) | 
+									 DRAM_TXSR_CYC(39) | DRAM_TMRD_CYC(1));
+								 
+			pDRAM->DRAM_CTL_CYC_1 = (DRAM_TWR_CYC(2) | DRAM_TRTP_CYC(0));   // 6E24	
+			pDRAM->DRAM_CTL_CYC_DDR = (DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1)); // 6E25		
+			// 6E36¡B6E37						 
+			pDRAM->DRAM_CTL_CYC_EXT = (DRAM_TRFC_EXT_CYC(25) | DRAM_TRFC_EXT_CYC_2(25) |
+									   DRAM_TXSR_EXT_CYC(39) );
+									 
+			pDRAM->DRAM_ARF_CYC = 3109;//6E1C 6E1D	
+					
+			RTNA_DBG_Str(0, "DDR2 400\r\n");
+			break;
+		case 300:
+			// 6E20
+			pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(5) | DRAM_TRC_CYC(8) |
+									 DRAM_TRCD_CYC(2) | DRAM_TRFC_CYC(19) | 
+									 DRAM_TRP_CYC(2) | DRAM_TRRD_CYC(1) | 
+									 DRAM_TXSR_CYC(29) | DRAM_TMRD_CYC(1));
+								 
+			pDRAM->DRAM_CTL_CYC_1 = (DRAM_TWR_CYC(2) | DRAM_TRTP_CYC(0));   // 6E24	
+			pDRAM->DRAM_CTL_CYC_DDR = (DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1)); // 6E25		
+			// 6E36¡B6E37						 
+			pDRAM->DRAM_CTL_CYC_EXT = (DRAM_TRFC_EXT_CYC(19) | DRAM_TRFC_EXT_CYC_2(19) |
+									  DRAM_TXSR_EXT_CYC(29) );
+									 
+			pDRAM->DRAM_ARF_CYC = 2328;//6E1C 6E1D
+			RTNA_DBG_Str(0, "DDR2 300\r\n");
+			break;
+		case 200:
+			// 6E20
+			pDRAM->DRAM_CTL_CYC_0 = (DRAM_TRAS_CYC(3) | DRAM_TRC_CYC(5) |
+									 DRAM_TRCD_CYC(1) | DRAM_TRFC_CYC(12) | 
+									 DRAM_TRP_CYC(1) | DRAM_TRRD_CYC(0) | 
+									 DRAM_TXSR_CYC(19) | DRAM_TMRD_CYC(1));
+								 
+			pDRAM->DRAM_CTL_CYC_1 = (DRAM_TWR_CYC(1) | DRAM_TRTP_CYC(0));   // 6E24	
+			pDRAM->DRAM_CTL_CYC_DDR = (DRAM_TXP_CYC(1) | DRAM_TWTR_CYC(1)); // 6E25		
+			// 6E36¡B6E37						 
+			pDRAM->DRAM_CTL_CYC_EXT = DRAM_TRFC_EXT_CYC(12) | DRAM_TRFC_EXT_CYC_2(12) |
+									  DRAM_TXSR_EXT_CYC(19);
+									 
+			pDRAM->DRAM_ARF_CYC = 1547;//6E1C 6E1D
+			RTNA_DBG_Str(0, "DDR2 200\r\n");
+			break;	
+		default:
+			RTNA_DBG_Str(0, "Un-supported DRAM ulClock !\r\n");
+   			return 1;
+   			break;	
+	};
+	RTNA_DBG_Str(0, "send dram init cmd\r\n");
+
+	#if (AUTO_DLL_LOCK == 1)
+	pDRAM->DRAM_DDR_DLL_REST_LB_CTL |= 0x02;   // 0x6e60
+	MMPF_OS_Sleep(10);
+	pDRAM->DRAM_DDR_DLL_REST_LB_CTL &=~ 0x02;  // 0x6e60
+	MMPF_OS_Sleep(10);
+	#endif
+	
+	// Jack
+	pDRAM->DRAM_DDR_DQPLK_PD_CTL = 0xC0; // 6E61
+	
+	//pDRAM->DRAM_FUNC &= ~(DRAM_SPRE_EN);    //disalbe smart precharge
+	//pDRAM->DRAM_FUNC &= ~(DRAM_EH_SPRE_EN); //disable enhanced smart precharge
+	  
+	pDRAM->DRAM_FUNC &= ~DRAM_PMP_EN; //disable pmp function for video play
+	///////
+	
+    if (ulClock == 400) {
+	    pDRAM->DRAM_DDR_CLK_MACRO_DLY = 0x68;//0x58;//6e70
+	}
+	else
+		pDRAM->DRAM_DDR_CLK_MACRO_DLY = 0x80;//0x58;//6e70 
+
+	    //pDRAM->DRAM_DDR_CLK_MACRO_DLY = 0x80;//0x58;//6e70 
+
+	#if 1  //Async DQ setting 1
+	//pDRAM->DRAM_DFI_CTL = 0x0B;//6E1B
+	pDRAM->DRAM_DFI_CTL = 0x1B;//6E1B
+	pDRAM->DRAM_DDR_DDR2_RD_DLY = 0x20;//6E1F
+	
+	pDRAM->DRAM_DDR_DQBLK0_CTL0 = 0x04;//6E92
+	pDRAM->DRAM_DDR_DQBLK1_CTL0 = 0x04;//6E97
+	pDRAM->DRAM_DDR_DQBLK2_CTL0 = 0x04;//6E9C
+	pDRAM->DRAM_DDR_DQBLK3_CTL0 = 0x04;//6EA1
+	
+	pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0x2C;//6E91
+	pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0x2C;//6E96
+	pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0x2C;//6E9B
+	pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0x2C;//6EA0
+	
+	pDRAM->DRAM_DDR_DQBLK0_WL_CTL = 0x01; //6EC5
+	pDRAM->DRAM_DDR_DQBLK1_WL_CTL = 0x01; //6ECD
+	pDRAM->DRAM_DDR_DQBLK2_WL_CTL = 0x01; //6ED5
+	pDRAM->DRAM_DDR_DQBLK3_WL_CTL = 0x01; //6EDD
+	
+	pDRAM->DRAM_DDR_DQBLK0_PAD_CTL_OPT = 0x70; // 6E94
+	pDRAM->DRAM_DDR_DQBLK1_PAD_CTL_OPT = 0x70; // 6E99
+	pDRAM->DRAM_DDR_DQBLK2_PAD_CTL_OPT = 0x70; // 6E9E
+	pDRAM->DRAM_DDR_DQBLK3_PAD_CTL_OPT = 0x70; // 6EA3
+	
+	pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = 0x60; // 6E90
+	pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = 0x60; // 6E95
+	pDRAM->DRAM_DDR_DQBLK2_SYNC_DLY_TUNE = 0x60; // 6E9A
+	pDRAM->DRAM_DDR_DQBLK3_SYNC_DLY_TUNE = 0x60; // 6E9F
+	
+	pDRAM->DRAM_BOTTOM_DDR_CLK_MACRO_CLK_CTL = 0x70; // 6EA5
+	
+	pDRAM->DRAM_DDR2_MODE_CLK_EN = 0xFF; //6E62
+	pDRAM->DRAM_DDR_DDR2_OPR_CTL = 0x0B; //6E72	
+	#endif
+	
+	//CL=5
+	pDRAM->DRAM_DDR2_OPT =  DRAM_DDR_DFIPHY_CLK_EN | DRAM_DDR_DFIPHY_CL5_EN; // 6EB7
+	pDRAM->DRAM_MODE_REG = 0x0453;//6E28¡B6E29
+	//pDRAM->DRAM_EXT_MODE_REG = 0x0400; //6E2A¡B6E2B - disable DQS_N
+    
+    
+    //enable ODT only for socket test
+	if (ulClock == 400) {
+	   // pDRAM->DRAM_EXT_MODE_REG = 0x0004;              //6E2A¡B6E2B - enable ODT
+       // *(volatile unsigned char *)0x80006eb7 |= 0x04;  //enable ODT
+    }	
+   	
+	// darren test for lib
+    if (ulClock == 200) {
+    	if (0) {
+			pDRAM->DRAM_DDR_DQBLK0_WL_CTL = 0x02; // 6EC5
+			pDRAM->DRAM_DDR_DQBLK1_WL_CTL = 0x02; // 6ECD
+			pDRAM->DRAM_DDR_DQBLK2_WL_CTL = 0x02; // 6ED5
+			pDRAM->DRAM_DDR_DQBLK3_WL_CTL = 0x02; // 6EDD
+			
+			pDRAM->DRAM_DDR_DQBLK0_CTL1 = 0x20; // 6E93
+			pDRAM->DRAM_DDR_DQBLK1_CTL1 = 0x20; // 6E98
+			pDRAM->DRAM_DDR_DQBLK2_CTL1 = 0x20; // 6E9D
+			pDRAM->DRAM_DDR_DQBLK3_CTL1 = 0x20; // 6EA2
+			
+			//DDR2 cmd delay if turn on lib timing
+			*(volatile unsigned char *)0x80006e1e |= 0x40;
+		}	
+		
+			
+	}
+	else if (ulClock == 300) {
+		pDRAM->DRAM_DDR_DQBLK1_CTL1 = 0x20; // 6E98
+		pDRAM->DRAM_DDR_DQBLK2_CTL1 = 0x1c; // 6E9D
+		
+	}	
+	else if (ulClock == 400) {
+		//pDRAM->DRAM_DDR_DQBLK1_WL_CTL = 0x02; // 6ECD -inv
+		//pDRAM->DRAM_DDR_DQBLK2_WL_CTL = 0x02; // 6ED5 -inv
+	
+		pDRAM->DRAM_DDR_DQBLK1_CTL1 = 0x20; // 6E98
+		pDRAM->DRAM_DDR_DQBLK2_CTL1 = 0x20; // 6E9D	
+	}
+	
+	// ZQ setting
+    if (ulClock == 400) {      
+		pDRAM->DRAM_DDR_DQBLK0_ZQ_CTL = 0x08;// 6EC6 - DDR2 PMOS driving
+		pDRAM->DRAM_DDR_DQBLK1_ZQ_CTL = 0x08;// 6ECE
+		pDRAM->DRAM_DDR_DQBLK2_ZQ_CTL = 0x08;// 6ED6
+		pDRAM->DRAM_DDR_DQBLK3_ZQ_CTL = 0x08;// 6EDE
+		
+		pDRAM->DRAM_DDR_DQBLK0_ODT_CTL1 = 0x08;//6EC1 - DDR2 NMOS driving
+		pDRAM->DRAM_DDR_DQBLK1_ODT_CTL1 = 0x08;//6EC9
+		pDRAM->DRAM_DDR_DQBLK2_ODT_CTL1 = 0x08;//6ED1
+		pDRAM->DRAM_DDR_DQBLK3_ODT_CTL1 = 0x08;//6ED9
+		
+		pDRAM->DRAM_TOP_ZQ_PMOS = 0x08;               // 6EA6	
+		pDRAM->DRAM_TOP_DDR_CLK_MACRO_CLK_CTL |= 0x40;// 6EA4
+    
+    }  
+	//////////////
+	
+	// increase scan range
+	if (gbSystemCoreID == CHIP_CORE_ID_MCR_V2_MP) {
+		// ++MCR_V2_MP Only
+		// cmd delay
+		//pDRAM->DRAM_ARF_QUEUE_DEPTH   |= 0x00; // 0x6E1E
+		// WR delay
+		pDDR3->DRAM_RD_WRLVL_DBG_EN   = 0x01; // 30f0
+		pDDR3->DRAM_DQ0_WRLVL_DLY_OPR = 0x20;//30f4
+		pDDR3->DRAM_DQ1_WRLVL_DLY_OPR = 0x20;//30f5
+		pDDR3->DRAM_DQ2_WRLVL_DLY_OPR = 0x20;//30f6
+		pDDR3->DRAM_DQ3_WRLVL_DLY_OPR = 0x20;//30f7
+		// --MCR_V2_MP Only
+	}
+	
+		//RDEYE
+    if (ulClock == 400 ) { 		
+       
+		pDRAM->DRAM_DDR_DQBLK0_CTL0 |= 0x08;//6E92
+		pDRAM->DRAM_DDR_DQBLK1_CTL0 |= 0x08;//6E97
+		pDRAM->DRAM_DDR_DQBLK2_CTL0 |= 0x08;//6E97
+		pDRAM->DRAM_DDR_DQBLK3_CTL0 |= 0x08;//6E97
+		
+		//pDRAM->DRAM_DQBLK0_RD_QCDL_CTL = 0x10; //6e80
+		//pDRAM->DRAM_DQBLK0_WR_QCDL_CTL = 0x10; //6e81 
+		
+		pDRAM->DRAM_DQBLK1_RD_QCDL_CTL = 0x18; //6e83
+		pDRAM->DRAM_DQBLK1_WR_QCDL_CTL = 0x0C; //6e84
+		 
+		pDRAM->DRAM_DQBLK2_RD_QCDL_CTL = 0x18; //6e86
+		pDRAM->DRAM_DQBLK2_WR_QCDL_CTL = 0x0c; //6e87 
+		
+		//pDRAM->DRAM_DQBLK3_RD_QCDL_CTL = 0x10; //6e89
+		//pDRAM->DRAM_DQBLK3_WR_QCDL_CTL = 0x10; //6e8a		
+		
+		pDRAM->DRAM_DDR_DLL1_CTL |= 0x01;  // 6e67
+	}
+	// dbg kidd
+	///////////
+   	MMPF_DRAM_SendInitCmd();
+
+	RTNA_DBG_Str(0, "Init DRAM done !\r\n");
+	RTNA_DBG_Str(0, "# Lock Code:");
+    RTNA_DBG_Byte(0, pDRAM->DRAM_DQBLK0_RD_QCDL_CTL);
+    RTNA_DBG_Str(0, "\r\n");
+    	
+	while(1);
+    return MMP_ERR_NONE;
+}
+#endif
+
+#if 0 // for IDE function name list by section
+void _____DDR3_MODE_____(){}
+#endif 
+#if (DRAM_ID == DRAM_DDR3)
+void MMPF_DRAM_LoadSetting(MMP_ULONG addr)
+{
+    DDR3Setting = *(DDR3_USER_SETTING *)addr;  
+    #if 0  
+    RTNA_DBG_Str(0,"ddr3.timing<-\r\n");
+    RTNA_DBG_Short(0,DDR3Setting.val[0]);
+    RTNA_DBG_Short(0,DDR3Setting.val[1]);
+    RTNA_DBG_Short(0,DDR3Setting.val[2]);
+    RTNA_DBG_Short(0,DDR3Setting.val[3]);
+    RTNA_DBG_Short(0,DDR3Setting.val[4]);
+    RTNA_DBG_Str(0,"->\r\n");
+    #endif
+    
+}
+
+MMP_BOOL MMPF_DRAM_SaveValidSetting(MMP_ULONG addr)
+{
+    if( (DDR3Setting.sig!=SIG_ID)) {
+        DDR3Setting.sig = (InvalidDDR3Test)?0xFFFF:SIG_ID;
+        *(volatile DDR3_USER_SETTING *)addr = DDR3Setting ;
+        return MMP_TRUE ;
+    }
+    return MMP_FALSE ;
+}
+
+static void MMPF_DRAM_InvalidSetting(void)
+{
+    InvalidDDR3Test = MMP_FALSE ;  
+}
+
+static MMP_USHORT MMPF_DRAM_GetItem(MMP_USHORT id)
+{
+/*
+hardcoding boundary for DQRead,WrLvl,Final Delay
+Just for in case the timing in flash is far from boundary
+*/
+    MMP_USHORT timing_bound[DDR3_DATA_ID_MAX][2] = {
+        { 0x40,0xD0 },
+        { 0x20,0x70 },
+        { 0x05,0x30 },
+        { 0x05,0x30 },
+        { 0x50,0xB0 } 
+    } ;
+    MMP_USHORT val ;
+    if(DDR3Setting.sig!=SIG_ID) {
+        return 0 ;
+    }
+    if(id < DDR3_DATA_ID_MAX ) {
+        val = DDR3Setting.val[id];
+        if ( ( val >= timing_bound[id][0] ) && ( val <= timing_bound[id][1] )  ) {
+            return val ;
+        } 
+        return 0 ;
+    }
+    return 0 ;    
+}
+
+static MMP_USHORT MMPF_DRAM_SetItem(MMP_USHORT id,MMP_USHORT val)
+{
+    if(id < DDR3_DATA_ID_MAX ) {
+        DDR3Setting.val[id] = val ;
+    }
+    return 0 ;
+}
+
+
+MMP_ERR MMPF_DRAM_Initialize(MMPF_DRAM_TYPE dramtype, MMP_ULONG *ulSize, MMP_ULONG ulClock, MMPF_DRAM_MODE drammode)
+{
+	AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	AITPS_MCI  pMCI  = AITC_BASE_MCI;
+	AITPS_DRAM_DDR3 pDDR3 = AITC_BASE_DDR3;
+	MMP_UBYTE  ubTmp;
+
+	if (ulClock == 528)
+		ulClock = 533;
+
+	MMPF_SYS_ResetHModule(MMPF_SYS_MDL_DRAM, MMP_FALSE);
+	MMPF_DRAM_ConfigPad(MMP_FALSE); // DDR3 only use top pad
+
+	//MCI bypass dram queue
+	pMCI->MCI_EXTM_TYPE   = MCI_EXTM_DRAM;      // 7710
+	pMCI->MCI_FB_DRAM_CTL = MCI_RD_AFTER_WR_EN; // 7711
+	//------------------------------------------------
+
+	pDRAM->DRAM_DFI_CTL = DRAM_RD_ASYNC_EN | DRAM_DLY_RDQS_EN; // dram async read 
+	pDRAM->DRAM_CTL_0 = DDR3_MODE | BANK_SIZE_8M; // Bank
+	pDRAM->DRAM_CTL_1 = DRAM_BUS_16 | DRAM_BANK_INTLV | DRAM_EXT_MODE_FIRST; // address mode & bus width
+	#if (DRAM_SIZE == 0x4000000)
+    pDRAM->DRAM_CTL_2 |= DRAM_ROW_4096 | DRAM_COL_1024;
+    #elif (DRAM_SIZE == 0x8000000)
+    pDRAM->DRAM_CTL_2 |= DRAM_ROW_8192 | DRAM_COL_1024;
+    #elif (DRAM_SIZE > 0x8000000)
+    pDRAM->DRAM_CTL_2 |= DRAM_ROW_16384 | DRAM_COL_1024;
+    #else
+    pDRAM->DRAM_CTL_2 |= DRAM_ROW_4096 | DRAM_COL_1024;
+    #endif
+
+	switch(ulClock) {
+	case 533:
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL0 = DRAM_RC_CYC(13) | DRAM_RAS_CYC(9);
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL1 = (DRAM_ATRA_CYC(4) | DRAM_ATWA_CYC(1) | 
+										   DRAM_RTP_CYC(5) | DRAM_WTP_CYC(11) | 
+										   DRAM_RDA_CYC(9) |DRAM_WRA_CYC(15) |
+										   DRAM_ARTP_CYC(5) | DRAM_AWTP_CYC(11));
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL2 = (DRAM_FAW_N_CYC(3) | DRAM_FAW_W_CYC(10) |
+										   DRAM_RRD_CYC(2) | DRAM_RCD_CYC(1) |
+										   DRAM_RW_RPA_CYC(3) | DRAM_RP_CYC(3) |
+										   DRAM_CCDS_CYC(1) | DRAM_RD2WRS_CYC(3) | DRAM_WR2RDS_CYC(6));								   
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL3 = (DRAM_CCDD_CYC(1) | DRAM_RD2WRD_CYC(3) | DRAM_WR2RDD_CYC(6));
+		
+		pDRAM->DRAM_RW_LATENCY1 |= DRAM_RL_DLY(6) | DRAM_WL_DLY(5); // 6E3A								   
+		pDRAM->DRAM_RW_LATENCY0 &= ~DRAM_RD_FRACDLY_EN; // 6E39
+		pDRAM->DRAM_RW_LATENCY0 |= DRAM_WR_FRACDLY_EN;  // 6E39
+		
+		pDDR3->DRAM_DDR3_TIMING_CTL0 = (DRAM_RSTW_CYC(51)|
+										DRAM_CKEI_CYC(9) | DRAM_DLLK_CYC(8) |
+										DRAM_ZQCI_CYC(7) | DRAM_ZQCL_CYC(4) | DRAM_ZQCS_CYC(2) |
+										DRAM_XPR_CYC(3) | DRAM_XPDLL_CYC(4) | DRAM_XP_CYC(1));
+		pDDR3->DRAM_DDR3_TIMING_CTL1 = (DRAM_REF_CYC(42) |
+										DRAM_MRD_CYC(1) | DRAM_MOD_CYC(5) |
+										DRAM_PD_CYC(1) | DRAM_CKESRE_CYC(2) | DRAM_CKSRX_CYC(2) |
+										DRAM_ODTH_CYC(2) | DRAM_ODTLOFF_CYC(4) | DRAM_ODTLON_CYC(4));
+		pDDR3->DRAM_DDR3_TIMING_CTL2 = (DRAM_RPA_CYC(3));																
+											
+		pDRAM->DRAM_ARF_CYC = 2078;//4156; // 6E1C, 6E1D	
+		
+		pDDR3->DRAM_DDR3_MR0_LOW_CFG  = 0x30; // 3010
+		pDDR3->DRAM_DDR3_MR0_HIGH_CFG = 0x05; // 3011
+		pDDR3->DRAM_DDR3_MR1_LOW_CFG  = 0x10; // 3012
+		pDDR3->DRAM_DDR3_MR1_HIGH_CFG = 0x00; // 3013
+		pDDR3->DRAM_DDR3_MR2_LOW_CFG  = 0x08; // 3014
+		pDDR3->DRAM_DDR3_MR2_HIGH_CFG = 0x00; // 3015
+		pDDR3->DRAM_DDR3_MR3_LOW_CFG  = 0x00; // 3016
+		 								   
+        RTNA_DBG_Str(0, "DDR3 533\r\n");
+		break;
+	case 400:
+	case 360:
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL0 = DRAM_RC_CYC(10) | DRAM_RAS_CYC(7);
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL1 = (DRAM_ATRA_CYC(3) | DRAM_ATWA_CYC(0) | 
+										   DRAM_RTP_CYC(3) | DRAM_WTP_CYC(9) | 
+										   DRAM_RDA_CYC(6) |DRAM_WRA_CYC(12) |
+										   DRAM_ARTP_CYC(3) | DRAM_AWTP_CYC(9));
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL2 = (DRAM_FAW_N_CYC(3) | DRAM_FAW_W_CYC(6) |
+										   DRAM_RRD_CYC(1) | DRAM_RCD_CYC(0) |
+										   DRAM_RW_RPA_CYC(2) | DRAM_RP_CYC(2) |
+										   DRAM_CCDS_CYC(1) | DRAM_RD2WRS_CYC(3) | DRAM_WR2RDS_CYC(6));								   
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL3 = (DRAM_CCDD_CYC(1) | DRAM_RD2WRD_CYC(3) | DRAM_WR2RDD_CYC(6));
+										   
+		pDRAM->DRAM_RW_LATENCY1 |= DRAM_RL_DLY(5) | DRAM_WL_DLY(4); // 6E3A								   
+		pDRAM->DRAM_RW_LATENCY0 &= ~DRAM_RD_FRACDLY_EN; // 6E39
+		pDRAM->DRAM_RW_LATENCY0 |= DRAM_WR_FRACDLY_EN;  // 6E39
+		
+		pDDR3->DRAM_DDR3_TIMING_CTL0 = (DRAM_RSTW_CYC(39)|
+										DRAM_CKEI_CYC(7) | DRAM_DLLK_CYC(8) |
+										DRAM_ZQCI_CYC(7) | DRAM_ZQCL_CYC(4) | DRAM_ZQCS_CYC(2) |
+										DRAM_XPR_CYC(3) | DRAM_XPDLL_CYC(4) | DRAM_XP_CYC(1));
+		pDDR3->DRAM_DDR3_TIMING_CTL1 = (DRAM_REF_CYC(31) |
+										DRAM_MRD_CYC(1) | DRAM_MOD_CYC(5) |
+										DRAM_PD_CYC(1) | DRAM_CKESRE_CYC(2) | DRAM_CKSRX_CYC(2) |
+										DRAM_ODTH_CYC(2) | DRAM_ODTLOFF_CYC(3) | DRAM_ODTLON_CYC(3));
+		pDDR3->DRAM_DDR3_TIMING_CTL2 = (DRAM_RPA_CYC(2));																
+										
+		//pDRAM->DRAM_CTL_0 |= BANK_SIZE_8M;
+		//pDRAM->DRAM_CTL_2 |= DRAM_ROW_8192 | DRAM_COL_1024;
+		//pDRAM->DRAM_CTL_1 |= DRAM_BUS_16 | DRAM_BANK_INTLV;  	
+		pDRAM->DRAM_ARF_CYC = 1562;//1562;//3125; // 6E1C, 6E1D	
+		
+		pDDR3->DRAM_DDR3_MR0_LOW_CFG  = 0x20; // 3010
+		pDDR3->DRAM_DDR3_MR0_HIGH_CFG = 0x05; // 3011
+        #if (USE_LGT_DDR3_SETTING)
+        pDDR3->DRAM_DDR3_MR1_LOW_CFG  = 0x12;//0x10 // 3012    //MR1
+        #else
+		pDDR3->DRAM_DDR3_MR1_LOW_CFG  = 0x10; // 3012
+        #endif
+		pDDR3->DRAM_DDR3_MR1_HIGH_CFG = 0x00; // 3013
+		pDDR3->DRAM_DDR3_MR2_LOW_CFG  = 0x00; // 3014
+		pDDR3->DRAM_DDR3_MR2_HIGH_CFG = 0x00; // 3015
+		pDDR3->DRAM_DDR3_MR3_LOW_CFG  = 0x00; // 3016
+		 								   
+        RTNA_DBG_Str(0, "DDR3 400\r\n");
+		break;
+	case 300:
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL0 = DRAM_RC_CYC(8) | DRAM_RAS_CYC(6);
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL1 = (DRAM_ATRA_CYC(2) | DRAM_ATWA_CYC(0) | 
+										   DRAM_RTP_CYC(3) | DRAM_WTP_CYC(8) | 
+										   DRAM_RDA_CYC(6) |DRAM_WRA_CYC(11) |
+										   DRAM_ARTP_CYC(3) | DRAM_AWTP_CYC(8));
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL2 = (DRAM_FAW_N_CYC(3) | DRAM_FAW_W_CYC(5) |
+										   DRAM_RRD_CYC(1) | DRAM_RCD_CYC(0) |
+										   DRAM_RW_RPA_CYC(2) | DRAM_RP_CYC(2) |
+										   DRAM_CCDS_CYC(1) | DRAM_RD2WRS_CYC(3) | DRAM_WR2RDS_CYC(6));								   
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL3 = (DRAM_CCDD_CYC(1) | DRAM_RD2WRD_CYC(3) | DRAM_WR2RDD_CYC(6));
+										   
+		pDRAM->DRAM_RW_LATENCY1 |= DRAM_RL_DLY(5) | DRAM_WL_DLY(4); 								   
+		pDRAM->DRAM_RW_LATENCY0 &= ~DRAM_RD_FRACDLY_EN; 
+		pDRAM->DRAM_RW_LATENCY0 |= DRAM_WR_FRACDLY_EN;
+		
+		pDDR3->DRAM_DDR3_TIMING_CTL0 = (DRAM_RSTW_CYC(32)|
+										DRAM_CKEI_CYC(6) | DRAM_DLLK_CYC(8) |
+										DRAM_ZQCI_CYC(7) | DRAM_ZQCL_CYC(4) | DRAM_ZQCS_CYC(2) |
+										DRAM_XPR_CYC(2) | DRAM_XPDLL_CYC(4) | DRAM_XP_CYC(1));
+		pDDR3->DRAM_DDR3_TIMING_CTL1 = (DRAM_REF_CYC(26) |
+										DRAM_MRD_CYC(1) | DRAM_MOD_CYC(5) |
+										DRAM_PD_CYC(1) | DRAM_CKESRE_CYC(2) | DRAM_CKSRX_CYC(2) |
+										DRAM_ODTH_CYC(2) | DRAM_ODTLOFF_CYC(3) | DRAM_ODTLON_CYC(3));
+		pDDR3->DRAM_DDR3_TIMING_CTL2 = (DRAM_RPA_CYC(2));																
+										
+		//pDRAM->DRAM_CTL_0 |= BANK_SIZE_8M;
+		//pDRAM->DRAM_CTL_2 |= DRAM_ROW_8192 | DRAM_COL_1024;
+		//pDRAM->DRAM_CTL_1 |= DRAM_BUS_16 | DRAM_BANK_INTLV;  	
+		pDRAM->DRAM_ARF_CYC = 2604; 	
+		
+		pDDR3->DRAM_DDR3_MR0_LOW_CFG  = 0x20;
+		pDDR3->DRAM_DDR3_MR0_HIGH_CFG = 0x05;
+		pDDR3->DRAM_DDR3_MR1_LOW_CFG  = 0x10;
+		pDDR3->DRAM_DDR3_MR1_HIGH_CFG = 0x00;
+		pDDR3->DRAM_DDR3_MR2_LOW_CFG  = 0x00;
+		pDDR3->DRAM_DDR3_MR2_HIGH_CFG = 0x00;
+		pDDR3->DRAM_DDR3_MR3_LOW_CFG  = 0x00;
+		 								   
+        RTNA_DBG_Str(0, "DDR3 300\r\n");
+		break;	
+	case 200:
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL0 = (DRAM_RC_CYC(5) | DRAM_RAS_CYC(3));
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL1 = (DRAM_ATRA_CYC(0) | DRAM_ATWA_CYC(0) | 
+										   DRAM_RTP_CYC(2) | DRAM_WTP_CYC(7) | 
+										   DRAM_RDA_CYC(4) |DRAM_WRA_CYC(9) |
+										   DRAM_ARTP_CYC(2) | DRAM_AWTP_CYC(7));
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL2 = (DRAM_FAW_N_CYC(3) | DRAM_FAW_W_CYC(1) |
+										   DRAM_RRD_CYC(0) | DRAM_RCD_CYC(0) |
+										   DRAM_RW_RPA_CYC(1) | DRAM_RP_CYC(1) |
+										   DRAM_CCDS_CYC(1) | DRAM_RD2WRS_CYC(3) | DRAM_WR2RDS_CYC(6));								   
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL3 = (DRAM_CCDD_CYC(1) |  DRAM_RD2WRD_CYC(3) | DRAM_WR2RDD_CYC(6));
+										   
+		pDRAM->DRAM_RW_LATENCY1 |= DRAM_RL_DLY(5) | DRAM_WL_DLY(5); 								   
+		pDRAM->DRAM_RW_LATENCY0 &= ~DRAM_RD_FRACDLY_EN; 
+		pDRAM->DRAM_RW_LATENCY0 &= ~DRAM_WR_FRACDLY_EN;
+		
+		pDDR3->DRAM_DDR3_TIMING_CTL0 = (DRAM_RSTW_CYC(19)|
+										DRAM_CKEI_CYC(4) | DRAM_DLLK_CYC(8) |
+										DRAM_ZQCI_CYC(7) | DRAM_ZQCL_CYC(4) | DRAM_ZQCS_CYC(2) |
+										DRAM_XPR_CYC(2) | DRAM_XPDLL_CYC(4) | DRAM_XP_CYC(1));
+		pDDR3->DRAM_DDR3_TIMING_CTL1 = (DRAM_REF_CYC(15) |
+										DRAM_MRD_CYC(1) | DRAM_MOD_CYC(5) |
+										DRAM_PD_CYC(1) | DRAM_CKESRE_CYC(2) | DRAM_CKSRX_CYC(2) |
+										DRAM_ODTH_CYC(2) | DRAM_ODTLOFF_CYC(3) | DRAM_ODTLON_CYC(3));
+		pDDR3->DRAM_DDR3_TIMING_CTL2 = (DRAM_RPA_CYC(1));																
+										
+		//pDRAM->DRAM_CTL_0 |= BANK_SIZE_8M;
+		//pDRAM->DRAM_CTL_2 |= DRAM_ROW_8192 | DRAM_COL_1024;
+		//pDRAM->DRAM_CTL_1 |= DRAM_BUS_16 | DRAM_BANK_INTLV;  	
+		pDRAM->DRAM_ARF_CYC = 782;//1563; 	
+		
+		pDDR3->DRAM_DDR3_MR0_LOW_CFG  = 0x20;
+		pDDR3->DRAM_DDR3_MR0_HIGH_CFG = 0x05;
+		pDDR3->DRAM_DDR3_MR1_LOW_CFG  = 0x11;
+		pDDR3->DRAM_DDR3_MR1_HIGH_CFG = 0x00;
+		pDDR3->DRAM_DDR3_MR2_LOW_CFG  = 0x08;
+		pDDR3->DRAM_DDR3_MR2_HIGH_CFG = 0x00;  
+		pDDR3->DRAM_DDR3_MR3_LOW_CFG  = 0x00;
+		 								   
+        RTNA_DBG_Str(0, "DDR3 200\r\n");
+		break;	
+	case 100:
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL0 = (DRAM_RC_CYC(5) | DRAM_RAS_CYC(3));
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL1 = (DRAM_ATRA_CYC(0) | DRAM_ATWA_CYC(0) | 
+										   DRAM_RTP_CYC(2) | DRAM_WTP_CYC(7) | 
+										   DRAM_RDA_CYC(4) |DRAM_WRA_CYC(9) |
+										   DRAM_ARTP_CYC(2) | DRAM_AWTP_CYC(7));
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL2 = (DRAM_FAW_N_CYC(3) | DRAM_FAW_W_CYC(1) |
+										   DRAM_RRD_CYC(0) | DRAM_RCD_CYC(0) |
+										   DRAM_RW_RPA_CYC(1) | DRAM_RP_CYC(1) |
+										   DRAM_CCDS_CYC(1) | DRAM_RD2WRS_CYC(3) | DRAM_WR2RDS_CYC(6));								   
+		pDDR3->DRAM_DDR3_RW_TIMING_CTL3 = (DRAM_CCDD_CYC(1) |  DRAM_RD2WRD_CYC(3) | DRAM_WR2RDD_CYC(6));
+										   
+		pDRAM->DRAM_RW_LATENCY1 |= DRAM_RL_DLY(5) | DRAM_WL_DLY(5); 								   
+		pDRAM->DRAM_RW_LATENCY0 &= ~DRAM_RD_FRACDLY_EN; 
+		pDRAM->DRAM_RW_LATENCY0 &= ~DRAM_WR_FRACDLY_EN;
+		
+		pDDR3->DRAM_DDR3_TIMING_CTL0 = (DRAM_RSTW_CYC(19)|
+										DRAM_CKEI_CYC(4) | DRAM_DLLK_CYC(8) |
+										DRAM_ZQCI_CYC(7) | DRAM_ZQCL_CYC(4) | DRAM_ZQCS_CYC(2) |
+										DRAM_XPR_CYC(2) | DRAM_XPDLL_CYC(4) | DRAM_XP_CYC(1));
+		pDDR3->DRAM_DDR3_TIMING_CTL1 = (DRAM_REF_CYC(15) |
+										DRAM_MRD_CYC(1) | DRAM_MOD_CYC(5) |
+										DRAM_PD_CYC(1) | DRAM_CKESRE_CYC(2) | DRAM_CKSRX_CYC(2) |
+										DRAM_ODTH_CYC(2) | DRAM_ODTLOFF_CYC(3) | DRAM_ODTLON_CYC(3));
+		pDDR3->DRAM_DDR3_TIMING_CTL2 = (DRAM_RPA_CYC(1));																
+										
+		//pDRAM->DRAM_CTL_0 |= BANK_SIZE_8M;
+		//pDRAM->DRAM_CTL_2 |= DRAM_ROW_8192 | DRAM_COL_1024;
+		//pDRAM->DRAM_CTL_1 |= DRAM_BUS_16 | DRAM_BANK_INTLV;  	
+		pDRAM->DRAM_ARF_CYC = 1563; 	
+		
+		pDDR3->DRAM_DDR3_MR0_LOW_CFG  = 0x20;
+		pDDR3->DRAM_DDR3_MR0_HIGH_CFG = 0x05;
+		pDDR3->DRAM_DDR3_MR1_LOW_CFG  = 0x11;
+		pDDR3->DRAM_DDR3_MR1_HIGH_CFG = 0x00;
+		pDDR3->DRAM_DDR3_MR2_LOW_CFG  = 0x08;
+		pDDR3->DRAM_DDR3_MR2_HIGH_CFG = 0x00;  
+		pDDR3->DRAM_DDR3_MR3_LOW_CFG  = 0x00;
+		 								   
+        RTNA_DBG_Str(0, "DDR3 100\r\n");
+		break;		
+	default:
+		RTNA_DBG_Str(0, "Un-supported DRAM ulClock !\r\n");
+   		return 1;
+		break;		
+	};
+	pDRAM->DRAM_DDR_DLL_REST_LB_CTL |= 0x02;   // 0x6e60
+	MMPF_OS_Sleep(3);
+	pDRAM->DRAM_DDR_DLL_REST_LB_CTL &=~ 0x02;  // 0x6e60
+	MMPF_OS_Sleep(3);
+	if (ulClock == 533) {
+		pDRAM->DRAM_DDR_CLK_MACRO_DLY = 0x54;//6e70
+		pDRAM->DRAM_TOP_DDR_CLK_MACRO_CLK_CTL = 0x03;//0x03; // 6EA4
+		pDRAM->DRAM_DDR_CLOCK_OPT             = 0x03;//0x03; // 6E6B        //CKP duty option
+		
+		// DQ
+		pDRAM->DRAM_DDR_DQBLK0_WL_CTL = 0 << 5; /// 6EC5
+		pDRAM->DRAM_DDR_DQBLK1_WL_CTL = 0 << 5; /// 6ECD
+		
+	}	
+	else if (ulClock == 400) {
+		//clk_inv + delay =0x0 + cmd_delay
+		pDRAM->DRAM_ARF_QUEUE_DEPTH   |= 0x40; // 6E1E   //cmd delay
+		#if DDR3_Q_PATCH>=2
+    		if (gNewScanRangeTable.ulSkipScan == 0xEFCD3412) {
+    			pDRAM->DRAM_DDR_CLK_MACRO_DLY  = gNewScanRangeTable.usBestDLY;
+    		}	
+    		else {
+    		    pDRAM->DRAM_DDR_CLK_MACRO_DLY  = 0x6C; // 6E70   //clk delay
+    		}    
+		#else
+		    pDRAM->DRAM_DDR_CLK_MACRO_DLY  = 0x6C; // 6E70   //clk delay
+        #endif
+        
+        #if (USE_LGT_DDR3_SETTING)
+        pDRAM->DRAM_ARF_QUEUE_DEPTH   |= 0x40; // 6E1E   //cmd delay
+
+		#if DDR3_Q_PATCH>=2
+    		if (gNewScanRangeTable.ulSkipScan == 0xEFCD3412) {
+    			pDRAM->DRAM_DDR_CLK_MACRO_DLY  = gNewScanRangeTable.usBestDLY;
+    		}	
+    		else {	
+    		    pDRAM->DRAM_DDR_CLK_MACRO_DLY  = 0x6C; // 6E70   //clk delay
+            }
+        #else
+            pDRAM->DRAM_DDR_CLK_MACRO_DLY  = 0x6C;
+        #endif
+        
+		pDRAM->DRAM_DDR_CLOCK_OPT      = 0x01;//0x00; // 6E6B        //CKP duty option
+		pDRAM->DRAM_TOP_DDR_CLK_MACRO_CLK_CTL |= 0x01; //CKN duty option
+        #else
+		pDRAM->DRAM_DDR_CLOCK_OPT      = 0x00;//0x00; // 6E6B        //CKP duty option
+        #endif
+
+		// DQ
+		pDRAM->DRAM_DDR_DQBLK0_WL_CTL = 0 << 5; /// 6EC5
+		pDRAM->DRAM_DDR_DQBLK1_WL_CTL = 0 << 5; /// 6ECD
+	}
+	else if (ulClock == 320) {
+		 pDRAM->DRAM_DDR_CLK_MACRO_DLY  = 0x38;    //clk delay	
+	} 
+	else 
+		pDRAM->DRAM_DDR_CLK_MACRO_DLY = 0x10;//6e70 - for 200MHz	
+	
+	pDDR3->DRAM_DDR3_RW_OPT = DRAM_DDR3_PRE_MODE_EN | DRAM_DDR3_ACT_PULLIN_EN | 
+							  DRAM_DDR3_ACT_NA_EN;   // 3032
+	pDDR3->DRAM_DDR3_OPT2   = 0x9E; // 3021
+	
+	#if 1  //Async DQ setting 1
+	if (ulClock == 400) {
+		pDRAM->DRAM_DDR_DQBLK0_CTL0 = 0x04;//6E92
+		pDRAM->DRAM_DDR_DQBLK1_CTL0 = 0x04;//6E97
+		pDRAM->DRAM_DDR_DQBLK2_CTL0 = 0x04;//6E9C
+		pDRAM->DRAM_DDR_DQBLK3_CTL0 = 0x04;//6EA1
+	}
+	else if (ulClock == 200) {
+		pDRAM->DRAM_DDR_DQBLK0_CTL0 = 0x04;//6E92
+		pDRAM->DRAM_DDR_DQBLK1_CTL0 = 0x04;//6E97
+		pDRAM->DRAM_DDR_DQBLK2_CTL0 = 0x04;//6E9C
+		pDRAM->DRAM_DDR_DQBLK3_CTL0 = 0x04;//6EA1
+	}	
+	else {
+		pDRAM->DRAM_DDR_DQBLK0_CTL0 = 0x04;//0x04;//6E92
+		pDRAM->DRAM_DDR_DQBLK1_CTL0 = 0x04;//0x04;//6E97
+		pDRAM->DRAM_DDR_DQBLK2_CTL0 = 0x04;//6E9C
+		pDRAM->DRAM_DDR_DQBLK3_CTL0 = 0x04;//6EA1
+	}
+
+	if (ulClock == 533) {
+		pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0x2C;//0x2C;//6E91
+		pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0x2C;//0x2C;//6E96
+		pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0x2C;//0x2C;//6E9B
+		pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0x2C;//0x2C;//6EA0
+	}
+	else if (ulClock == 400) {
+		pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0x2C;//6E91
+		pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0x2C;//6E96
+		pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0x2C;//6E9B
+		pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0x2C;//6EA0
+	}
+	else if (ulClock == 200) {
+		pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0x2C;//6E91
+		pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0x2C;//6E96
+		pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0x2C;//6E9B
+		pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0x2C;//6EA0
+	}	
+	else {
+		pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0x2C;//6E91
+		pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0x2C;//6E96
+		pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0x2C;//6E9B
+		pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0x2C;//6EA0
+	}
+
+	if (ulClock == 533 ) {
+		pDRAM->DRAM_DDR_DQBLK0_PAD_CTL_OPT = 0x70; // 6E94 - IO Driving [DDR3]
+		pDRAM->DRAM_DDR_DQBLK1_PAD_CTL_OPT = 0x70; // 6E99
+		pDRAM->DRAM_DDR_DQBLK2_PAD_CTL_OPT = 0x70; // 6E9E
+		pDRAM->DRAM_DDR_DQBLK3_PAD_CTL_OPT = 0x70; // 6EA3
+		pDRAM->DRAM_BOTTOM_DDR_CLK_MACRO_CLK_CTL = 0x70; // 6EA5 - CLK IO Driving
+	}
+	else if (ulClock == 400) {
+        #if (USE_LGT_DDR3_SETTING)
+        pDRAM->DRAM_DDR_DQBLK0_PAD_CTL_OPT = 0x60; // 6E94 - IO Driving [DDR3]
+        pDRAM->DRAM_DDR_DQBLK1_PAD_CTL_OPT = 0x60; // 6E99
+        pDRAM->DRAM_DDR_DQBLK2_PAD_CTL_OPT = 0x60; // 6E9E
+        pDRAM->DRAM_DDR_DQBLK3_PAD_CTL_OPT = 0x60; // 6EA3
+        #else
+		pDRAM->DRAM_DDR_DQBLK0_PAD_CTL_OPT = 0x70; // 6E94 - IO Driving [DDR3]
+		pDRAM->DRAM_DDR_DQBLK1_PAD_CTL_OPT = 0x70; // 6E99
+		pDRAM->DRAM_DDR_DQBLK2_PAD_CTL_OPT = 0x70; // 6E9E
+		pDRAM->DRAM_DDR_DQBLK3_PAD_CTL_OPT = 0x70; // 6EA3
+        #endif
+		pDRAM->DRAM_BOTTOM_DDR_CLK_MACRO_CLK_CTL = 0x70; // 6EA5 - CLK IO Driving
+	}
+	else if (ulClock == 200 || ulClock == 100) {
+		ubTmp = 0x70;
+		pDRAM->DRAM_DDR_DQBLK0_PAD_CTL_OPT = ubTmp; // 6E94 - IO Driving [DDR3]
+		pDRAM->DRAM_DDR_DQBLK1_PAD_CTL_OPT = ubTmp; // 6E99
+		pDRAM->DRAM_DDR_DQBLK2_PAD_CTL_OPT = ubTmp; // 6E9E
+		pDRAM->DRAM_DDR_DQBLK3_PAD_CTL_OPT = ubTmp;// 6EA3
+		pDRAM->DRAM_BOTTOM_DDR_CLK_MACRO_CLK_CTL = 0x60; // 6EA5 - CLK IO Driving
+	}
+	else {
+		pDRAM->DRAM_DDR_DQBLK0_PAD_CTL_OPT = 0x70; // 6E94 - IO Driving [DDR3]
+		pDRAM->DRAM_DDR_DQBLK1_PAD_CTL_OPT = 0x70; // 6E99
+		pDRAM->DRAM_DDR_DQBLK2_PAD_CTL_OPT = 0x70; // 6E9E
+		pDRAM->DRAM_DDR_DQBLK3_PAD_CTL_OPT = 0x70; // 6EA3
+		pDRAM->DRAM_BOTTOM_DDR_CLK_MACRO_CLK_CTL = 0x70; // 6EA5 - CLK IO Driving
+	}	
+	
+	if (ulClock == 533 || ulClock == 400 || ulClock == 360 ||
+        ulClock == 200 || ulClock == 100) {
+		// calibration testing
+		// ZQ PMOS calibration
+        MMPF_DRAM_ZQCalibration();
+	}
+
+	if (ulClock == 533) {
+		pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = 0x90;//0x70; // 6E90
+		pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = 0x90;//0x70; // 6E95
+	} 
+	else if (ulClock == 400) {
+		pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = 0xA0;//0xA0;//0x70; // 6E90
+		pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = 0xA0;//0xA0;//0x70; // 6E95
+	} 
+	else if (ulClock == 200) {
+		pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = 0x70; // 6E90
+		pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = 0x70; // 6E95
+	}
+	else {
+		pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = 0x70; // 6E90
+		pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = 0x70; // 6E95
+	}
+
+	pDRAM->DRAM_DDR_DQPLK_PD_CTL = 0xC0; // 6E61
+	pDRAM->DRAM_DDR2_MODE_CLK_EN = 0xFF; // 6E62
+	pDRAM->DRAM_DDR_DDR2_OPR_CTL = 0x0B; // 6E72
+	
+	#endif
+	
+	// MR register setting test for 400MHz
+	if (ulClock == 533) {
+		if (1) {
+			// dram ODT
+			pDDR3->DRAM_DDR3_MR1_HIGH_CFG  = 0x00; //0x3013
+			pDDR3->DRAM_DDR3_MR1_LOW_CFG   = 0x14; //0x3012
+			pDDR3->DRAM_DDR3_MR2_HIGH_CFG  = 0x00; //0x3015
+			pDDR3->DRAM_DDR3_OPT1          |= 0x0A; //0x3020
+		}	
+
+	}
+	else if (ulClock == 400) {
+        if (0) {
+            pDDR3->DRAM_DDR3_MR1_HIGH_CFG  = 0x00; //0x3013
+            pDDR3->DRAM_DDR3_MR1_LOW_CFG   = 0x14; //0x3012
+            pDDR3->DRAM_DDR3_MR2_HIGH_CFG  = 0x00; //0x3015
+            pDDR3->DRAM_DDR3_OPT1          |= 0x0A; //0x3020
+        }
+        pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xA0;//6E91
+        pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xA0;//6E96
+        pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xA0;//6E9B
+        pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xA0;//6EA0
+
+#if (SETTING_FOR_DDR3_Q)
+        #if DDR3_Q_PATCH==0
+            pDRAM->DRAM_DQBLK0_RDAS_CTL = 0xE;
+            pDRAM->DRAM_DQBLK1_RDAS_CTL = 0xE;
+        #else 
+            if ( ( (pDRAM->DRAM_DQBLK0_RD_QCDL_CTL)>=0x19 ) && ( (pDRAM->DRAM_DQBLK0_WR_QCDL_CTL)>=0x19 ) ){
+            	pDRAM->DRAM_DQBLK0_RDAS_CTL = 0xE; 
+            	pDRAM->DRAM_DQBLK1_RDAS_CTL = 0xE;
+            }
+            else {
+            	pDRAM->DRAM_DQBLK0_RDAS_CTL = 0x18; 
+            	pDRAM->DRAM_DQBLK1_RDAS_CTL = 0x18;
+            }    
+            #if DDR3_Q_PATCH>=2        
+			if (gNewScanRangeTable.ulSkipScan == 0xEFCD3412) {
+				pDRAM->DRAM_DQBLK0_RDAS_CTL = gNewScanRangeTable.usBestAsyncRd;; 
+				pDRAM->DRAM_DQBLK1_RDAS_CTL = gNewScanRangeTable.usBestAsyncRd;; 
+			}
+            #endif
+            
+        #endif
+#else
+        pDRAM->DRAM_DQBLK0_RDAS_CTL = 0x23;
+        pDRAM->DRAM_DQBLK1_RDAS_CTL = 0x23;
+#endif //(SETTING_FOR_DDR3_Q)
+
+        pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xAC;//6E91
+        pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xAC;//6E96
+        pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xAC;//6E9B
+        pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xAC;//6EA0
+	}
+
+	// increase scan range
+	if (1) {
+		if (ulClock == 533) {
+			// cmd delay
+			pDRAM->DRAM_ARF_QUEUE_DEPTH   &= ~0xC0; // 0x6E1E
+			pDRAM->DRAM_ARF_QUEUE_DEPTH   |= 0x80; // 0x6E1E
+		}
+		else if (ulClock == 400) {
+			// cmd delay
+			pDRAM->DRAM_ARF_QUEUE_DEPTH   &= ~0xC0; // 0x6E1E
+			pDRAM->DRAM_ARF_QUEUE_DEPTH   |= 0x80; // 0x6E1E
+		}
+		else if (ulClock == 200) {
+			// ++MCR_V2_MP Only
+			// cmd delay
+			pDRAM->DRAM_ARF_QUEUE_DEPTH   |= 0x40; // 0x6E1E
+			// WR delay
+			if (1) {
+				pDDR3->DRAM_RD_WRLVL_DBG_EN   = 0x01;// 30f0
+				pDDR3->DRAM_DQ0_WRLVL_DLY_OPR = 0x20;//30f4
+				pDDR3->DRAM_DQ1_WRLVL_DLY_OPR = 0x20;//30f5
+				pDDR3->DRAM_DQ2_WRLVL_DLY_OPR = 0x20;//30f6
+				pDDR3->DRAM_DQ3_WRLVL_DLY_OPR = 0x20;//30f7
+			}	
+			// --MCR_V2_MP Only
+		}
+	}
+
+	MMPF_DRAM_SendInitCmd();
+
+	if (ulClock == 533) {
+		pDRAM->DRAM_FUNC &= ~DRAM_PMP_EN; // 6E18, 6E19
+		
+		// WRLVL
+		if (1) {
+			pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L0 = 0x1C >> 2;//0x24 >> 2;//0x1C >> 2;// 305A
+			pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L1 = 0x20 >> 2;//0x24 >> 2;//0x1C >> 2;// 305B
+			pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xff;  //305f  - trigger
+		}
+		
+		//GATE Training
+		//winbond without probe
+		if (1) {
+			pDRAM->DRAM_RW_LATENCY1 = 0x3D;               //6e3A
+			pDRAM->DRAM_RW_LATENCY0 = 0x01;               //6e39 
+			pDDR3->DRAM_DDR3_AFE_RD_GATE_DH_L0 = (0x7C-pDRAM->DRAM_DQBLK0_RD_QCDL_CTL-0x20) >> 2;     //3055  - B0 GT delay
+			pDDR3->DRAM_DDR3_AFE_RD_GATE_DH_L1 = (0x94-pDRAM->DRAM_DQBLK0_RD_QCDL_CTL-0x20) >> 2;     //3056  - B1 GT delay
+			pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xff;  //305f  - trigger
+			pDRAM->DRAM_DDR_DQBLK0_RG_CTL = 0x01;          //6eC4
+			pDRAM->DRAM_DDR_DQBLK1_RG_CTL = 0x01;          //6eCC	
+		}
+	}
+	else if (ulClock == 400) {
+		pDRAM->DRAM_FUNC &= ~DRAM_PMP_EN; // 6E18, 6E19
+
+		// WRLVL
+		if (1) {
+#if (SETTING_FOR_DDR3_Q)
+            pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L0 = 0x30 >> 2;
+			pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L1 = 0x30 >> 2;
+#else
+			pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L0 = 0x50 >> 2;//0x20 >> 2;// 305A
+			pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L1 = 0x50 >> 2;//0x20 >> 2;// 305B
+#endif
+			pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xff;  //305f  - trigger
+		}
+		
+		//GATE Training
+		//winbond without probe
+		if (0) {
+			pDRAM->DRAM_RW_LATENCY1 = 0x34;               //6e3A
+			pDRAM->DRAM_RW_LATENCY0 = 0x01;               //6e39 
+			pDDR3->DRAM_DDR3_AFE_RD_GATE_DH_L0 = (0x88-/*pDRAM->DRAM_DQBLK0_RD_QCDL_CTL*/0x30) >> 2;     //3055  - B0 GT delay
+			pDDR3->DRAM_DDR3_AFE_RD_GATE_DH_L1 = (0xA0-/*pDRAM->DRAM_DQBLK0_RD_QCDL_CTL*/0x30) >> 2;     //3056  - B1 GT delay
+			pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xff;  //305f  - trigger
+			pDRAM->DRAM_DDR_DQBLK0_RG_CTL = 0x01;          //6eC4
+			pDRAM->DRAM_DDR_DQBLK1_RG_CTL = 0x01;          //6eCC	
+		}		
+		
+		//RDEYE
+		if (0) {
+			pDRAM->DRAM_DDR_DQBLK0_CTL0 |= 0x08;//6E92
+			pDRAM->DRAM_DDR_DQBLK1_CTL0 |= 0x08;//6E97
+			
+			pDRAM->DRAM_DQBLK0_RD_QCDL_CTL = 0x17; //6e80
+			pDRAM->DRAM_DQBLK0_WR_QCDL_CTL = 0x17; //6e81 - maybe useless, because analog use rd for default
+			
+			pDRAM->DRAM_DQBLK1_RD_QCDL_CTL = 0x17; //6e83
+			pDRAM->DRAM_DQBLK1_WR_QCDL_CTL = 0x17; //6e84 - maybe useless, because analog use rd for default
+			pDRAM->DRAM_DDR_DLL1_CTL |= 0x01;  // 6e67
+		}
+
+		//RD-EYE Calibration 
+		if (0) {
+			pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = 0xF0;//0x70; // 6E90
+			pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = 0xF0;//0x70; // 6E95
+			
+			pDRAM->DRAM_DDR_DQBLK0_CTL_OPT |= 0x80;//6E91
+			pDRAM->DRAM_DDR_DQBLK1_CTL_OPT |= 0x80;//6E96
+			pDRAM->DRAM_DDR_DQBLK2_CTL_OPT |= 0x80;//6E9B
+			pDRAM->DRAM_DDR_DQBLK3_CTL_OPT |= 0x80;//6EA0
+			
+			pDRAM->DRAM_DDR_DQBLK0_CTL0 |= 0x08;//6E92
+			pDRAM->DRAM_DDR_DQBLK1_CTL0 |= 0x08;//6E97
+			
+			pDRAM->DRAM_DQBLK0_RD_QCDL_CTL = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL; //6e80
+			pDRAM->DRAM_DQBLK0_WR_QCDL_CTL = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL; //6e81 - maybe useless, because analog use rd for default
+			
+			pDRAM->DRAM_DQBLK1_RD_QCDL_CTL = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL; //6e83
+			pDRAM->DRAM_DQBLK1_WR_QCDL_CTL = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL; //6e84 - maybe useless, because analog use rd for default
+			
+			pDRAM->DRAM_DQBLK0_RDAS_CTL = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL;//6e82
+			pDRAM->DRAM_DQBLK1_RDAS_CTL = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL;//6e85
+			pDRAM->DRAM_DDR_DLL1_CTL |= 0x01;  // 6e67
+			while(1);
+		}
+	}
+	else if (ulClock == 360) {
+		//WRLVL
+		pDRAM->DRAM_RW_LATENCY0 = 0x00;               //6E39  - WL Frac 
+	}
+	else if (ulClock == 320) {
+		//winbond without probe
+		pDRAM->DRAM_RW_LATENCY0 = 0x00;               //6E39  - WL Frac 
+		pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L0 = 0x14;     //305a  - B0 WL delay
+		pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L1 = 0x17;     //305b  - B1 WL delay
+		pDDR3->DRAM_DDR3_AFE_WR_DQS_DL    = 0x00;     //305e  
+		pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xff; //305f  - trigger
+		
+		//RDEYE
+		pDRAM->DRAM_DDR_DQBLK0_CTL0 |= 0x08;//6E92
+		pDRAM->DRAM_DDR_DQBLK1_CTL0 |= 0x08;//6E97
+		
+		pDRAM->DRAM_DQBLK0_RD_QCDL_CTL = 0x10; //6e80
+		pDRAM->DRAM_DQBLK0_WR_QCDL_CTL = 0x10; //6e81 - maybe useless, because analog use rd for default
+		
+		pDRAM->DRAM_DQBLK1_RD_QCDL_CTL = 0x10; //6e83
+		pDRAM->DRAM_DQBLK1_WR_QCDL_CTL = 0x10; //6e84 - maybe useless, because analog use rd for default
+		pDRAM->DRAM_DDR_DLL1_CTL |= 0x01;  // 6e67
+	}
+	else if (ulClock == 200) {
+		pDRAM->DRAM_FUNC &= ~DRAM_PMP_EN; // 6E18, 6E19
+	}
+	// Fix DDR3 bug
+	pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH |= 0x02; // 0x3066
+
+	RTNA_DBG_Str3("Init DRAM done!\r\n");
+	RTNA_DBG_Str0("RD/WR Lock Code:");
+	RTNA_DBG_Byte0(pDRAM->DRAM_DQBLK0_RD_QCDL_CTL);
+	RTNA_DBG_Byte0(pDRAM->DRAM_DQBLK0_WR_QCDL_CTL);
+	RTNA_DBG_Str0("\r\n");
+    return MMP_ERR_NONE;
+}
+
+MMP_ERR MMPF_DRAM_ZQCalibration(void)
+{
+	AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	MMP_LONG   i;
+	
+	// ZQ PMOS calibration
+	pDRAM->DRAM_DDR_DQBLK2_CAL_EN = DRAM_ZQ_CAL_EN; //0x6ED3
+	for (i = 3; i < 32; i++) {
+		pDRAM->DRAM_DDR_DQBLK2_ZQ_CTL = 0x40 | i; // 6ED6
+		MMPF_PLL_WaitCount(5); // wait 30ns
+		if (pDRAM->DRAM_DDR_DQBLK2_ZQ_RSL & 0x04) {
+			pDRAM->DRAM_DDR_DQBLK0_ZQ_CTL = i; // 6EC6
+			pDRAM->DRAM_DDR_DQBLK1_ZQ_CTL = i; // 6ECE
+			pDRAM->DRAM_DDR_DQBLK2_ZQ_CTL = i; // 6ED6
+			pDRAM->DRAM_DDR_DQBLK3_ZQ_CTL = i; // 6EDE
+			pDRAM->DRAM_TOP_ZQ_PMOS 	  = i; // 6EA6
+			RTNA_DBG_Byte0(i);
+            RTNA_DBG_Str0(": ZQ PMOS\r\n");
+			break;
+		}
+	}
+	pDRAM->DRAM_DDR_DQBLK2_ZQ_CTL &= ~0x40;   // 6ED6
+	if (i == 32)
+		RTNA_DBG_Str(0, "ZQ PMOS calibration is failed.\r\n");
+	
+	// ZQ NMOS calibration
+	for (i = 3; i < 32; i++) {
+		pDRAM->DRAM_DDR_DQBLK2_ODT_CTL1 = 0x40 | i; // 6ED1
+		MMPF_PLL_WaitCount(5); // wait 30ns
+		if (pDRAM->DRAM_DDR_DQBLK2_ZQ_RSL & 0x08) {
+			pDRAM->DRAM_DDR_DQBLK0_ODT_CTL1 = i; // 6EC1
+			pDRAM->DRAM_DDR_DQBLK1_ODT_CTL1 = i; // 6EC9
+			pDRAM->DRAM_DDR_DQBLK2_ODT_CTL1 = i; // 6ED1
+			pDRAM->DRAM_DDR_DQBLK3_ODT_CTL1 = i; // 6eD9
+			pDRAM->DRAM_TOP_DDR_CLK_MACRO_CLK_CTL |= i << 3; // 6EA4
+			RTNA_DBG_Byte0(i);
+            RTNA_DBG_Str0(": ZQ NMOS\r\n");
+			break;
+		}
+	}
+	pDRAM->DRAM_DDR_DQBLK2_ODT_CTL1 &=~0x40; // 6ED1
+	if (i == 32)
+		RTNA_DBG_Str(0, "ZQ NMOS calibration is failed.\r\n");
+
+	pDRAM->DRAM_DDR_DQBLK2_CAL_EN &= ~DRAM_ZQ_CAL_EN; //0x6ED3
+	
+	return MMP_ERR_NONE;	
+}
+
+MMP_ERR MMPF_DRAM_WRLVLCalibration(void)
+{
+	AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	MMP_ULONG  ulScanNum = DRAM_SCAN_NUM(15);
+	AITPS_DRAM_DDR3 pDDR3 = AITC_BASE_DDR3;
+	MMP_ULONG  tmpData, step[2], ulstep, ulStopStep;
+	MMP_LONG   i, j;
+	MMP_BOOL   FindZero = MMP_FALSE, dbg_EN = MMP_FALSE;
+	MMP_USHORT min_byte0, min_byte1, max_byte0, max_byte1;
+	MMP_BYTE   Cal_allzero = 0, Cal_num = 0;
+	//MMP_ULONG  ulTimeStart, ulTimeEnd;
+	
+	pDDR3->DRAM_DDR3_WRL_PT &= ~DRAM_SCAN_NUM_MASK; // 0x3062
+	pDDR3->DRAM_DDR3_WRL_PT |= ulScanNum; // 0x3062
+	pDDR3->DRAM_DDR3_AFE_DLY_CTL = DRAM_WRLVL_DONE; // 0x3084
+	
+	pDDR3->DRAM_DDR3_WRL_DLY_INIT_L0 = 0; // 0x307C
+	pDDR3->DRAM_DDR3_WRL_DLY_INIT_L1 = 0; // 0x307D
+	
+	// step value = lock code
+	ulstep = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL + 0x17;
+	
+	ulStopStep = 1;
+	if (dbg_EN) {
+		RTNA_DBG_Str(0, "\r\n+++++++++++++++");
+	}
+	// WRLVL Calibration
+	while (1) {
+		Cal_num++;		
+		pDDR3->DRAM_DDR3_WRL_DLY_STEP_L0 = ulstep; // 0x3080
+		pDDR3->DRAM_DDR3_WRL_DLY_STEP_L1 = ulstep; // 0x3081
+		
+		// trigger
+		pDDR3->DRAM_DDR3_CMD_REQUEST |= DRAM_WRLVL_EN; // 0x3023
+		while (pDDR3->DRAM_DDR3_CMD_REQUEST != 0); // 0x3023  
+		
+		if (dbg_EN) {
+			RTNA_DBG_Str(0, "\r\ninit value:");
+			RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_WRL_DLY_INIT_L0);
+			RTNA_DBG_Str(0, ", ");
+			RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_WRL_DLY_INIT_L1);
+			RTNA_DBG_Str(0, "\r\nstep value:");
+			RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_WRL_DLY_STEP_L0);
+			RTNA_DBG_Str(0, ", ");
+			RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_WRL_DLY_STEP_L1);
+			RTNA_DBG_Str(0, "\r\noutput after trigger:");
+			RTNA_DBG_Long(0, *(volatile unsigned int *)0x80003088);		
+		} 
+		if (*(volatile unsigned int *)0x80003088 == 0)
+			Cal_allzero++;
+		
+		// find 0->1, byte 0
+		step[0] = 0;
+		tmpData = pDDR3->DRAM_RDL_WRL_RES_SUM0 &= 0x55555555; // 0x3088
+		FindZero = MMP_FALSE;
+		for (j = 30; j >= 0; j-=2) {	
+		    if (FindZero == MMP_FALSE) {
+		        if ((tmpData & (1 << j)) == 0) 
+		            FindZero = MMP_TRUE;
+		    }
+		    else {
+			    if (tmpData & (1 << j)) {
+				    step[0] = (30-j)/2-1;
+				    /*if (step[0] == 0) {
+				        FindZero = MMP_FALSE;
+				        continue;
+				    }*/      
+				    break;
+			    }
+			}    	
+		}
+				
+		// find 0->1, byte 1
+		step[1] = 0;
+		tmpData = pDDR3->DRAM_RDL_WRL_RES_SUM0 &= 0xAAAAAAAA; // 0x3088
+		FindZero = MMP_FALSE;
+		for (j = 31; j >= 1; j-=2) {
+		    if (FindZero == MMP_FALSE) {
+		        if ((tmpData & (1 << j)) == 0)
+		            FindZero = MMP_TRUE;
+		    }
+		    else {
+			    if (tmpData & (1 << j)) {
+				    step[1] = (31-j)/2-1;
+				    /*if (step[1] == 0) {
+				        FindZero = MMP_FALSE;
+				        continue;
+				    }*/     
+				    break;
+				}    
+			}	
+		}				
+		// dbg kidd
+		if (ulstep <= ulStopStep) {
+			min_byte0 = 0;
+			max_byte0 = 0;
+			min_byte1 = 0;
+			max_byte1 = 0;
+			for (i = 0; i < 100; i++) {
+				pDDR3->DRAM_DDR3_CMD_REQUEST |= DRAM_WRLVL_EN; // 0x3023
+				while (pDDR3->DRAM_DDR3_CMD_REQUEST != 0); // 0x3023   
+				// find 0->1, byte 0
+				step[0] = 0;
+				tmpData = pDDR3->DRAM_RDL_WRL_RES_SUM0 &= 0x55555555; // 0x3088
+				FindZero = MMP_FALSE;
+				for (j = 30; j >= 0; j-=2) {	
+				    if (FindZero == MMP_FALSE) {
+				        if ((tmpData & (1 << j)) == 0) 
+				            FindZero = MMP_TRUE;
+				    }
+				    else {
+					    if (tmpData & (1 << j)) {
+						    step[0] = (30-j)/2-1;
+						    /*if (step[0] == 0) {
+						        FindZero = MMP_FALSE;
+						        continue;
+						    }*/      
+						    break;
+					    }
+					}    	
+				}
+						
+				// find 0->1, byte 1
+				step[1] = 0;
+				tmpData = pDDR3->DRAM_RDL_WRL_RES_SUM0 &= 0xAAAAAAAA; // 0x3088
+				FindZero = MMP_FALSE;
+				for (j = 31; j >= 1; j-=2) {
+				    if (FindZero == MMP_FALSE) {
+				        if ((tmpData & (1 << j)) == 0)
+				            FindZero = MMP_TRUE;
+				    }
+				    else {
+					    if (tmpData & (1 << j)) {
+						    step[1] = (31-j)/2-1;
+						    /*if (step[1] == 0) {
+						        FindZero = MMP_FALSE;
+						        continue;
+						    }*/      
+						    break;
+						}    
+					}	
+				}
+				
+				if (i == 0)	{
+					min_byte0 = step[0];
+					max_byte0 = step[0];
+					min_byte1 = step[1];
+					max_byte1 = step[1];
+				}
+				else {
+					if (step[0] < min_byte0)
+						min_byte0 = step[0];
+					if (step[0] > max_byte0)
+						max_byte0 = step[0];
+					if (step[1] < min_byte1)
+						min_byte1 = step[1];
+					if (step[1] > max_byte1)
+						max_byte1 = step[1];	
+				}
+			}
+			
+			if (dbg_EN) {
+				RTNA_DBG_Str(0, "\r\nmin_byte0:");
+		        RTNA_DBG_Byte(0, min_byte0);
+		        RTNA_DBG_Str(0, "\r\nmax_byte0:");
+		        RTNA_DBG_Byte(0, max_byte0);
+		        RTNA_DBG_Str(0, "\r\nmin_byte1:");
+		        RTNA_DBG_Byte(0, min_byte1);
+		        RTNA_DBG_Str(0, "\r\nmax_byte1:");
+		        RTNA_DBG_Byte(0, max_byte1);
+			}	
+			
+			step[0] = (min_byte0+max_byte0)/2;
+			step[1] = (min_byte1+max_byte1)/2;
+		}
+		
+		if (dbg_EN) {
+			RTNA_DBG_Str(0, "\r\nsearch step:");
+			RTNA_DBG_Byte(0, step[0]);
+			RTNA_DBG_Str(0, ", ");
+			RTNA_DBG_Byte(0, step[1]);
+		} 
+		
+		if (ulstep <= ulStopStep)
+		    pDDR3->DRAM_DDR3_WRL_DLY_INIT_L0 += pDDR3->DRAM_DDR3_WRL_DLY_STEP_L0*(step[0]); // 0x307C
+		else if (step[0] > 2)	
+		    pDDR3->DRAM_DDR3_WRL_DLY_INIT_L0 += pDDR3->DRAM_DDR3_WRL_DLY_STEP_L0*(step[0]-2); // 0x307C
+		
+		if (ulstep <= ulStopStep)
+		    pDDR3->DRAM_DDR3_WRL_DLY_INIT_L1 += pDDR3->DRAM_DDR3_WRL_DLY_STEP_L1*(step[1]); // 0x307B	
+		else if (step[1] > 2)	
+		    pDDR3->DRAM_DDR3_WRL_DLY_INIT_L1 += pDDR3->DRAM_DDR3_WRL_DLY_STEP_L1*(step[1]-2); // 0x307B	
+		
+		if (ulstep <= ulStopStep)
+			break;
+		// update step value
+		ulstep = ulstep / 2; 	
+	}	
+	
+	if (Cal_allzero == Cal_num)
+		return MMP_SYSTEM_ERR_NOT_SUPPORT;
+
+	pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L0 = pDDR3->DRAM_DDR3_WRL_DLY_INIT_L0 >> 2; // 0x305A
+	pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L1 = pDDR3->DRAM_DDR3_WRL_DLY_INIT_L1 >> 2; // 0x305B
+	
+	if (dbg_EN) {
+		RTNA_DBG_Str(0, "\r\nWR-LVL Dly:");
+		RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L0);
+		RTNA_DBG_Str(0, ", ");
+		RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L1);
+	}
+
+	// update
+	pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xFF; // 0x305F	
+	if (dbg_EN) {
+		RTNA_DBG_Str(0, "\r\n---------------");
+	}
+	return MMP_ERR_NONE;	
+}
+
+MMP_ERR MMPF_DRAM_GateTrainingCalibration(void)
+{
+	AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	MMP_ULONG  ulScanNum = DRAM_GT_SCAN_NUM(15);
+	AITPS_DRAM_DDR3 pDDR3 = AITC_BASE_DDR3;
+	MMP_ULONG  tmpData, step[2], ulstep;
+	MMP_LONG   j;
+	MMP_BOOL   FindZero = MMP_FALSE, bRD_CLK_PLUS = MMP_FALSE, dbg_EN = MMP_FALSE;
+	MMP_USHORT byte_dly;
+	MMP_ULONG  ulQuarterT, ulStopStep;
+	MMP_BYTE   btmp;
+
+	pDDR3->DRAM_DDR3_RDL_PT &= ~DRAM_GT_SCAN_MASK; // 0x3061
+	pDDR3->DRAM_DDR3_RDL_PT |= ulScanNum; // 0x3061
+	pDDR3->DRAM_DDR3_RDL_OPT = DRAM_GATE_TRAINING_EN; // 0x3060
+	pDDR3->DRAM_DDR3_AFE_DLY_CTL = DRAM_GT_DONE; // 0x3084
+
+#if (SETTING_FOR_DDR3_Q)
+    ulQuarterT = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL;
+#else
+    ulQuarterT = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL + 0x17;
+#endif
+
+	pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH &= ~0x0F;
+	pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0 = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL;//ulQuarterT; // 0x3064
+	pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1 = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL;//ulQuarterT; // 0x3065
+	
+	// step value = lock code
+	ulstep = ulQuarterT;
+	ulStopStep = 1;
+	
+	// Gate Training Calibration
+	while (1) {
+		pDDR3->DRAM_DDR3_RDL_GATE_STEP_L0 = ulstep; // 0x3068
+		pDDR3->DRAM_DDR3_RDL_GATE_STEP_L1 = ulstep; // 0x3069
+		
+		// dbg kidd
+		if (dbg_EN) {
+			RTNA_DBG_Str(0, "\r\ninit value: ");
+			RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH & 0x03);
+			RTNA_DBG_Str(0, "-");
+	        RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0);
+	        RTNA_DBG_Str(0, ", ");
+	        RTNA_DBG_Byte(0, (pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH & 0x0C) >> 2);
+			RTNA_DBG_Str(0, "-");
+	        RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1);
+	        RTNA_DBG_Str(0, "\r\nstep value: ");
+	        RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_RDL_GATE_STEP_L0);
+	        RTNA_DBG_Str(0, ", ");
+	        RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_RDL_GATE_STEP_L1);
+		}
+		///////////
+		// trigger
+		for (j = 0; j < 1; j++) {
+			pDDR3->DRAM_DDR3_CMD_REQUEST |= DRAM_RDLVL_EN; // 0x3023
+			while (pDDR3->DRAM_DDR3_CMD_REQUEST != 0); // 0x3023
+			// dbg kidd
+			if (dbg_EN) {
+				RTNA_DBG_Str(0, "\r\nresult:");
+		        RTNA_DBG_Long(0, *(volatile unsigned int *)0x80003088);
+			}
+		}
+
+		bRD_CLK_PLUS = MMP_FALSE;
+		// find 0->1, byte 0
+		step[0] = 0;
+		tmpData = pDDR3->DRAM_RDL_WRL_RES_SUM0 &= 0x55555555; // 0x3088
+		FindZero = MMP_FALSE;
+		for (j = 30; j >= 0; j-=2) {	
+		    if (FindZero == MMP_FALSE) {
+		        if ((tmpData & (1 << j)) == 0) 
+		            FindZero = MMP_TRUE;
+		    }
+		    else {
+			    if (tmpData & (1 << j)) {
+				    step[0] = (30-j)/2-1;
+				    /*if (step[0] == 0) {
+				        FindZero = MMP_FALSE;
+				        continue;
+				    }*/      
+				    break;
+			    }
+			} 
+			if (j == 0) 
+				bRD_CLK_PLUS = MMP_TRUE;   	
+		}	
+		
+		// find 0->1, byte 1
+		step[1] = 0;
+		tmpData = pDDR3->DRAM_RDL_WRL_RES_SUM0 &= 0xAAAAAAAA; // 0x3088
+		FindZero = MMP_FALSE;
+		for (j = 31; j >= 1; j-=2) {
+		    if (FindZero == MMP_FALSE) {
+		        if ((tmpData & (1 << j)) == 0)
+		            FindZero = MMP_TRUE;
+		    }
+		    else {
+			    if (tmpData & (1 << j)) {
+				    step[1] = (31-j)/2-1;
+				    /*if (step[1] == 0) {
+				        FindZero = MMP_FALSE;
+				        continue;
+				    }*/     
+				    break;
+				}    
+			}	
+			if (j == 1)
+				bRD_CLK_PLUS = MMP_TRUE;  
+		}
+
+		// dbg kidd
+		if (dbg_EN) {
+			RTNA_DBG_Str(0, "\r\nsearch step: ");
+	        RTNA_DBG_Byte(0, step[0]);
+	        RTNA_DBG_Str(0, ", ");
+	        RTNA_DBG_Byte(0, step[1]);
+	        RTNA_DBG_Str(0, "\r\nnext init: ");
+	        RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0 + pDDR3->DRAM_DDR3_RDL_GATE_STEP_L0*step[0]);
+	        RTNA_DBG_Str(0, ", ");
+	        RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1 + pDDR3->DRAM_DDR3_RDL_GATE_STEP_L1*step[1]);
+	        
+		}
+		///////////
+
+		if ((((pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0 + pDDR3->DRAM_DDR3_RDL_GATE_STEP_L0*step[0]) > 0xD0 || 
+			 (pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1 + pDDR3->DRAM_DDR3_RDL_GATE_STEP_L1*step[1]) > 0xD0) &&
+			 ulstep > 0x01) || bRD_CLK_PLUS) {
+			// dbg kidd
+			if (dbg_EN) {
+				if (bRD_CLK_PLUS)
+					RTNA_DBG_Str(0, "\r\nAll-0");
+				RTNA_DBG_Str(0, "\r\nAdd RD-ClK: ");
+		        RTNA_DBG_Byte(0, *(volatile unsigned char *)0x80006E39);
+		        RTNA_DBG_Str(0, ", ");
+		        RTNA_DBG_Byte(0, *(volatile unsigned char *)0x80006E3A);
+			}
+			///////////
+			
+			// add read clock delay 1T
+			if ((pDRAM->DRAM_RW_LATENCY0 & 0x02) == 0x00) {
+				pDRAM->DRAM_RW_LATENCY0 |= 0x02;
+			}
+			else {
+				if ((pDRAM->DRAM_RW_LATENCY1 & 0x38) != 0x38) {
+					btmp = ((pDRAM->DRAM_RW_LATENCY1 & 0x38) >> 3)+1;
+					pDRAM->DRAM_RW_LATENCY1 &= ~0x38;
+					pDRAM->DRAM_RW_LATENCY1 |= btmp << 3;
+					pDRAM->DRAM_RW_LATENCY0 &= ~0x02;
+				}
+				else {
+					RTNA_DBG_Str(0, "\r\nWARNING, Gate-Training RD clock-delay is overflow.");
+					while (1); 
+				}
+			}
+			// dbg kidd
+			if (dbg_EN) {
+				RTNA_DBG_Str(0, " to ");
+		        RTNA_DBG_Byte(0, *(volatile unsigned char *)0x80006E39);
+		        RTNA_DBG_Str(0, ", ");
+		        RTNA_DBG_Byte(0, *(volatile unsigned char *)0x80006E3A);
+			}
+			///////////
+			
+			pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0 = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL;//ulQuarterT; // 0x3064
+			pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1 = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL;//ulQuarterT; // 0x3065
+			ulstep = ulQuarterT;
+			continue;	
+		}	
+		
+		// update byte0
+		if (ulstep <= ulStopStep) {
+			pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH |= ((pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0 + pDDR3->DRAM_DDR3_RDL_GATE_STEP_L0*(step[0])) >> 8);
+		    pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0 += pDDR3->DRAM_DDR3_RDL_GATE_STEP_L0*(step[0]); // 0x3064
+		}    
+		else if (step[0] > 2) {	
+			pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH |= ((pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0 + pDDR3->DRAM_DDR3_RDL_GATE_STEP_L0*(step[0]-2)) >> 8);
+		    pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0 += pDDR3->DRAM_DDR3_RDL_GATE_STEP_L0*(step[0]-2); // 0x3064
+		}    
+		
+		// update byte1
+		if (ulstep <= ulStopStep) {
+			pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH |= ((pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1 + pDDR3->DRAM_DDR3_RDL_GATE_STEP_L1*(step[1])) >> 8) << 2;
+		    pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1 += pDDR3->DRAM_DDR3_RDL_GATE_STEP_L1*(step[1]); // 0x3065
+		}    	
+		else if (step[1] > 2) {	
+			pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH |= ((pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1 + pDDR3->DRAM_DDR3_RDL_GATE_STEP_L1*(step[1]-2)) >> 8) << 2; 
+		    pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1 += pDDR3->DRAM_DDR3_RDL_GATE_STEP_L1*(step[1]-2); // 0x3065	
+		}    
+		
+		if (ulstep <= ulStopStep)
+			break;
+		// update step value
+		ulstep = ulstep / 2; 				
+	}
+	
+	// subtract T/4
+	byte_dly = ((pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH & 0x03) << 8) + pDDR3->DRAM_DDR3_RDL_GATE_INIT_L0;
+	if (1) {
+		RTNA_DBG_Str(0, "\r\nRD-Dly Byte0");
+		RTNA_DBG_Short(0, byte_dly);
+	}
+	if (byte_dly > ulQuarterT)
+		pDDR3->DRAM_DDR3_AFE_RD_GATE_DH_L0 = (byte_dly - ulQuarterT) >> 2; // 0x3055
+		
+	byte_dly = ((pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH & 0x0C) << 6) + pDDR3->DRAM_DDR3_RDL_GATE_INIT_L1;
+	if (1) {
+		RTNA_DBG_Str(0, "\r\nRD-Dly Byte1");
+		RTNA_DBG_Short(0, byte_dly);
+	}
+	if (byte_dly > ulQuarterT)
+		pDDR3->DRAM_DDR3_AFE_RD_GATE_DH_L1 = (byte_dly - ulQuarterT) >> 2; // 0x3056
+
+	// update
+	pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xFF; // 0x305F
+
+	if (1) {
+		//RTNA_DBG_Str(0, "\r\nulQuarterT:");
+		//RTNA_DBG_Short(0, ulQuarterT);
+		RTNA_DBG_Str(0, "\r\n6E39, 6E3A:");
+		RTNA_DBG_Byte(0, *(volatile unsigned char *)0x80006E39);
+		RTNA_DBG_Str(0, ", ");
+		RTNA_DBG_Byte(0, *(volatile unsigned char *)0x80006E3A);
+		RTNA_DBG_Str(0, "\r\nRD delay:");
+		RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_AFE_RD_GATE_DH_L0);
+		RTNA_DBG_Str(0, ", ");
+		RTNA_DBG_Byte(0, pDDR3->DRAM_DDR3_AFE_RD_GATE_DH_L1);
+		RTNA_DBG_Str(0, "\r\n");
+	} 
+	
+	return MMP_ERR_NONE;	
+}
+
+MMP_ERR MMPF_DRAM_RDDataEyeCalibration()
+{
+ 	AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	MMP_ULONG  ulScanNum = DRAM_DE_SCAN_NUM(15);
+	AITPS_DRAM_DDR3 pDDR3 = AITC_BASE_DDR3;
+	MMP_ULONG  tmpData, step[2];
+	MMP_LONG   i, j;
+	
+	pDDR3->DRAM_DDR3_RDL_PT &= ~DRAM_DE_SCAN_MASK; // 0x3061
+	pDDR3->DRAM_DDR3_RDL_PT = ulScanNum; // 0x3061
+	
+	pDDR3->DRAM_DDR3_RDL_DETS1_INIT_L0 = 0; // 0x306C
+	pDDR3->DRAM_DDR3_RDL_DETS1_INIT_L1 = 0; // 0x306D
+	
+	// RD Data Eye Calibration
+	for (i = 128; i >= 2; i-=2) {
+		pDDR3->DRAM_DDR3_RDL_DETS1_STEP_L0 = i; // 0x3070
+		pDDR3->DRAM_DDR3_RDL_DETS1_STEP_L1 = i; // 0x3071
+		
+		// Set Eye Training Seg1 enable only
+		pDDR3->DRAM_DDR3_RDL_OPT = DRAM_DATA_EYE_EN; // 0x3060
+		
+		// trigger
+		pDDR3->DRAM_DDR3_CMD_REQUEST |= DRAM_RDLVL_EN; // 0x3023
+		while ((pDDR3->DRAM_DDR3_AFE_DLY_CTL & DRAM_RESULT_MASK) != DRAM_DE_DONE); // 0x3084
+		
+		// find middle of 1s, byte 0
+		step[0] = 0;
+		step[1] = 0;
+		tmpData = pDDR3->DRAM_RDL_WRL_RES_SUM0 &= 0x55555555; // 0x3088
+		for (j = 30; j >= 0; j-=2) {
+			if (tmpData & (1 << j)) {
+				if (step[0] == 0 && step[1] == 0)
+					step[0] = j/2;
+				else if (step[1] == 0){
+					step[1] = j/2;
+				}		
+			}	
+			else if (step[0] !=0 && step[1] != 0)
+				break;
+		}	
+		step[0] = (step[0]+step[1])/2;
+		pDDR3->DRAM_DDR3_RDL_DETS1_INIT_L0 += pDDR3->DRAM_DDR3_RDL_DETS1_STEP_L0*step[0]; // 0x306C
+		
+		// find middle of 1s, byte 1
+		step[0] = 0;
+		step[1] = 0;
+		tmpData = pDDR3->DRAM_RDL_WRL_RES_SUM0 &= 0xAAAAAAAA; // 0x3088
+		for (j = 31; j >= 1; j-=2) {
+			if (tmpData & (1 << j)) {
+				if (step[0] == 0 && step[1] == 0)
+					step[0] = j/2;
+				else if (step[1] == 0){
+					step[1] = j/2;
+				}	
+			}	
+			else if (step[0] !=0 && step[1] != 0)
+				break;
+		}
+		step[1] = (step[0]+step[1])/2;
+		pDDR3->DRAM_DDR3_RDL_DETS1_INIT_L1 += pDDR3->DRAM_DDR3_RDL_DETS1_STEP_L1*step[1]; // 0x306D					
+	}
+	
+	// DQ0-RD, DQ0-WR
+	pDRAM->DRAM_DQBLK0_RD_QCDL_CTL = pDDR3->DRAM_DDR3_RDL_DETS1_INIT_L0; // 0x6E80
+	pDRAM->DRAM_DQBLK0_WR_QCDL_CTL = pDDR3->DRAM_DDR3_RDL_DETS1_INIT_L0; // 0x6E81
+	
+	// DQ1-RD, DQ1-WR
+	pDRAM->DRAM_DQBLK1_RD_QCDL_CTL = pDDR3->DRAM_DDR3_RDL_DETS1_INIT_L1; // 0x6E83
+	pDRAM->DRAM_DQBLK1_WR_QCDL_CTL = pDDR3->DRAM_DDR3_RDL_DETS1_INIT_L1; // 0x6E84
+	
+	// set to manual mode
+	pDRAM->DRAM_DDR_DLL1_CTL = DDR3_DQ0_ODT_EN; // 0x6E67
+	
+	
+	return MMP_ERR_NONE;	
+}
+#endif // end of DRAM_ID == DRAM_DDR3
+
+void MMPF_DRAM_SendInitCmd(void)
+{
+    AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	
+	#if (DRAM_ID == DRAM_DDR3 || DRAM_ID == DRAM_DDR)
+    pDRAM->DRAM_CTL_4 = DRAM_INIT_CLEAN;//6E14   
+    pDRAM->DRAM_INT_HOST_SR |= (DRAM_PRE_ALL_DONE | DRAM_INIT_DONE | DRAM_CMD_FINISH);//6E0D
+    pDRAM->DRAM_CTL_4 = DRAM_INIT_ST;//6E14
+
+    while(!(pDRAM->DRAM_INT_HOST_SR & DRAM_INIT_DONE));//Polling 6E0D
+    #endif
+    #if (DRAM_ID == DRAM_DDR2)
+    pDRAM->DRAM_CTL_4 = DRAM_INIT_CLEAN;//6E14   
+    pDRAM->DRAM_INT_HOST_SR |= (DRAM_PRE_ALL_DONE | DRAM_INIT_DONE);//6E0D
+    pDRAM->DRAM_CTL_4 = DRAM_INIT_ST;//6E14
+    
+    pDRAM->DRAM_CMD_CTL2 = 0x10; // 6E33
+    while((pDRAM->DRAM_INT_HOST_SR & 0x8C00) != 0x8800);//Polling 6E0D
+    
+    pDRAM->DRAM_CMD_CTL2 = 0x08; // 6E33
+    while((pDRAM->DRAM_INT_HOST_SR & 0x8E00) != 0x8A00);//Polling 6E0D
+    #endif
+}
+#endif
+
+//*----------------------------------------------------------------------------
+//* Function Name       : MMPF_DRAM_SendCommand
+//* Input Parameters    : none
+//* Output Parameters   : none
+//* Functions called    : Initial Dram
+//*----------------------------------------------------------------------------
+MMP_ERR MMPF_DRAM_SendCommand(MMP_USHORT usCmd)
+{
+	MMP_ULONG	i;
+	AITPS_DRAM pDRAM = AITC_BASE_DRAM;
+	
+	#if (CHIP == MCR_V2)
+	pDRAM->DRAM_CMD_CTL0 = usCmd;
+	pDRAM->DRAM_CMD_CTL0 = 0;
+	#endif
+	
+	for (i = 0;i < 0x10; i++);
+
+	return	MMP_ERR_NONE;
+}
+//*----------------------------------------------------------------------------
+//* Function Name       : MMPF_DRAM_SetPowerDown
+//* Input Parameters    : none
+//* Output Parameters   : none
+//* Functions called    : Initial Dram
+//*----------------------------------------------------------------------------
+MMP_ERR MMPF_DRAM_SetPowerDown(MMP_BOOL bEnterPowerDown)
+{
+    if ((m_dramtype == MMPF_DRAM_TYPE_NONE) || (m_dramMode == MMPF_DRMA_MAX_MODE))
+        MMPF_DRAM_InitSettings();
+
+	if (bEnterPowerDown) {
+
+		MMPF_DRAM_ConfigPad(MMP_TRUE);
+	}
+	else {
+
+		MMPF_DRAM_ConfigPad(MMP_FALSE);
+	}
+	return	MMP_ERR_NONE;
+}
+
+void MMPF_DRAM_InitSettings(void)
+{
+	AITPS_GBL pGBL = AITC_BASE_GBL;
+	MMP_UBYTE id = pGBL->GBL_CHIP_VER;
+
+    m_dramtype = MMPS_System_GetConfig()->stackMemoryType;
+    m_dramMode = MMPS_System_GetConfig()->stackMemoryMode;
+    
+    #if (CHIP == MCR_V2)
+    id &= GBL_CHIP_VER_MASK;
+    m_dramSize = id;
+    #endif
+}
+
+MMP_ERR MMPF_DRAM_GetStackSize(MMP_ULONG *ulSize)
+{
+    #if (DRAM_ID == DRAM_DDR)
+    AITPS_GBL pGBL = AITC_BASE_GBL;
+    MMP_UBYTE id = pGBL->GBL_CHIP_VER;
+
+    id &= GBL_CHIP_VER_MASK;
+
+    *ulSize = m_usDramSizeTable[id] *1024 *1024;
+    switch (id & 0x03) {
+    case 0x00:
+        *ulSize = 32 *1024 *1024; // 32MB
+        break;
+    case 0x01:
+        *ulSize = 64 *1024 *1024; // 64MB
+        break;
+    case 0x02:
+        *ulSize = 128 *1024 *1024; // 128MB
+        break;			
+    default:
+        break;
+    }
+    #endif
+
+    #if (DRAM_ID == DRAM_DDR3)||(DRAM_ID == DRAM_DDR2)
+    *ulSize = DRAM_SIZE;
+    #endif
+
+    return MMP_ERR_NONE;
+}
+
+/* #pragma arm section code = "EnterSelfSleepMode", rwdata = "EnterSelfSleepMode",  zidata = "EnterSelfSleepMode" */
+//*----------------------------------------------------------------------------
+//* Function Name       : MMPF_DRAM_SetSelfRefresh
+//* Input Parameters    : none
+//* Output Parameters   : none
+//* Functions called    : Initial Dram
+//*----------------------------------------------------------------------------
+MMP_ERR MMPF_DRAM_SetSelfRefresh(MMP_BOOL bEnterSelfRefresh)
+{
+	static AITPS_DRAM   pDRAM = AITC_BASE_DRAM;
+
+    if ((m_dramtype == MMPF_DRAM_TYPE_NONE) || (m_dramMode == MMPF_DRMA_MAX_MODE))
+        MMPF_DRAM_InitSettings();
+    
+    if (bEnterSelfRefresh) {
+
+        #if (CHIP == MCR_V2)
+        pDRAM->DRAM_FUNC &= ~(DRAM_CLK_GATE_EN);  // 6E18
+		pDRAM->DRAM_CMD_CTL0 = DRAM_SRF_ST; // 6E30
+		while((pDRAM->DRAM_INT_CPU_SR & DRAM_SRF_DONE) == 0);
+		pDRAM->DRAM_INT_CPU_SR = DRAM_SRF_DONE; // 6E04, clear status
+		pDRAM->DRAM_FUNC |= (DRAM_CLK_GATE_EN); // 6E18
+        #endif
+	}
+	else {
+
+        #if (CHIP == MCR_V2)
+        pDRAM->DRAM_FUNC &= ~(DRAM_CLK_GATE_EN); // 6E18
+		pDRAM->DRAM_CMD_CTL0 = DRAM_EXIT_SRF_ST; // 6E30
+		while((pDRAM->DRAM_INT_CPU_SR & DRAM_EXIT_SRF_ST) == 0);
+		pDRAM->DRAM_INT_CPU_SR = DRAM_EXIT_SRF_ST; // 6E04, clear status
+		pDRAM->DRAM_FUNC |= (DRAM_CLK_GATE_EN); // 6E18
+        #endif
+	}
+	return	MMP_ERR_NONE;
+}
+
+//*----------------------------------------------------------------------------
+//* Function Name       : MMPF_DRAM_ConfigPad
+//* Input Parameters    : none
+//* Output Parameters   : none
+//*----------------------------------------------------------------------------
+MMP_ERR MMPF_DRAM_ConfigPad(MMP_BOOL bEnterPowerDown)
+{
+	MMP_ULONG	i;
+
+	AITPS_PAD pPAD = AITC_BASE_PAD;
+
+	if (bEnterPowerDown) {
+
+		// recovery to default values
+		//0x5100~0x511F
+		for(i = 0x0;i < 0x20;i++) {   
+    		pPAD->PAD_IO_CFG_PSTM_B[i] = (PAD_OUT_DRIVING(0x1) | PAD_FAST_SLEW |
+                                        PAD_PULL_DOWN | PAD_NORMAL_TRIG);
+        }
+        
+        // 0x5120
+        pPAD->PAD_IO_CFG_PSTM_T[0x00] = (PAD_OUT_DRIVING(0x1) | PAD_FAST_SLEW |
+                                        PAD_PULL_UP | PAD_NORMAL_TRIG);
+        // 0x5121                                
+        pPAD->PAD_IO_CFG_PSTM_T[0x01] = (PAD_OUT_DRIVING(0x1) | PAD_FAST_SLEW |
+                                        PAD_PULL_DOWN | PAD_NORMAL_TRIG); 
+        // 0x5122                                
+        pPAD->PAD_IO_CFG_PSTM_T[0x02] = (PAD_OUT_DRIVING(0x1) | PAD_FAST_SLEW |
+                                        PAD_PULL_UP | PAD_NORMAL_TRIG);                               
+                                        
+        // 0x5123~0x5129
+        for(i = 0x3;i < 0x0A;i++) {   
+    		pPAD->PAD_IO_CFG_PSTM_T[i] = (PAD_OUT_DRIVING(0x1) | PAD_FAST_SLEW |
+                                        PAD_PULL_DOWN | PAD_NORMAL_TRIG);
+        }
+        
+        // 0x512A
+        pPAD->PAD_IO_CFG_PSTM_T[0x0A] = (PAD_OUT_DRIVING(0x1) | PAD_FAST_SLEW |
+                                        PAD_PULL_UP | PAD_NORMAL_TRIG);
+        // 0x512B
+        pPAD->PAD_IO_CFG_PSTM_T[0x0B] = (PAD_OUT_DRIVING(0x1) | PAD_FAST_SLEW |
+                                        PAD_PULL_UP | PAD_NORMAL_TRIG);
+        // 0x512C~0x5155                                
+        for(i = 0x0C;i < 0x36;i++) {   
+    		pPAD->PAD_IO_CFG_PSTM_T[i] = (PAD_OUT_DRIVING(0x1) | PAD_FAST_SLEW |
+                                        PAD_PULL_DOWN | PAD_NORMAL_TRIG);
+        }
+	}
+	else {
+
+        #if (USE_LGT_DDR3_SETTING)
+            #define PAD_SLEW	PAD_FAST_SLEW
+        #else
+            #define PAD_SLEW	PAD_SLOW_SLEW
+        #endif
+
+        //0x5100~0x511F
+        for(i = 0x0;i < 0x20;i++) {   
+    		pPAD->PAD_IO_CFG_PSTM_B[i] = (PAD_OUT_DRIVING(0x2) | PAD_SLEW |
+                                        PAD_PULL_DOWN | PAD_SCHMITT_TRIG);
+        }
+        
+        #if (DRAM_ID == DRAM_DDR3)
+        // 0x5120~0x5155
+        for(i = 0x00;i < 0x36;i++) {   
+    		pPAD->PAD_IO_CFG_PSTM_T[i] = (PAD_OUT_DRIVING(0x2) | PAD_SLEW |
+                                        PAD_PULL_DOWN | PAD_SCHMITT_TRIG);
+        }
+        #endif
+        
+        #if (DRAM_ID == DRAM_DDR2)
+        // 0x5120~0x5155
+        for(i = 0x00;i < 0x36;i++) {   
+    		pPAD->PAD_IO_CFG_PSTM_T[i] = (PAD_OUT_DRIVING(0x2) | PAD_SLEW |
+                                        PAD_PULL_DOWN | PAD_SCHMITT_TRIG);
+        }
+        #endif
+        
+        #if (DRAM_ID == DRAM_DDR)
+        // 0x5120~0x5155
+        for(i = 0x00;i < 0x36;i++) {   
+    		pPAD->PAD_IO_CFG_PSTM_T[i] = (PAD_OUT_DRIVING(0x2) | PAD_SLEW |
+                                        PAD_PULL_DOWN | PAD_SCHMITT_TRIG);
+        }
+        #endif
+	}
+
+	return	MMP_ERR_NONE;
+}
+/* #pragma arm section code, rwdata,  zidata */
+
+#if (AUTO_DRAM_LOCKCORE)
+#if defined(MBOOT_FW)||defined(UPDATER_FW)
+static void generate_ecc(MMP_ULONG addr, MMP_ULONG *ecc)
+{
+    volatile unsigned char *reg_b = (volatile unsigned char *)0x80000000;
+    volatile unsigned short *reg_s = (volatile unsigned short *)0x80000000;
+    volatile unsigned int *reg_n = (volatile unsigned int *)0x80000000;
+
+	#if (CHIP == MCR_V2)
+	reg_b[0x5E01] = 0x60;
+    reg_b[0x5E01] = 0x51;
+    reg_b[0x5E17] = 0x80; //clear DMA done status
+    reg_b[0x5E02] = 0x00;
+    reg_b[0x5E35] = 0x00;
+
+    reg_b[0x5E4B] = 1; //endundancy en
+    reg_s[0x5E10 >> 1] = 511; //DMA length
+    reg_b[0x5E01] &= ~(0x2); //data flow: MEM -> SM
+    reg_n[0x5E0C >> 2] = addr;
+    reg_b[0x5E12] = 1; //SM DMA en
+    while(reg_b[0x5E12] & 1);
+
+    ecc[0] = reg_n[0x5E04 >> 2] & 0x00FFFFFF;
+    ecc[1] = reg_n[0x5E08 >> 2] & 0x00FFFFFF;
+	#endif
+}
+
+/* #pragma arm section code = "RESETMCI", rwdata = "RESETMCI",  zidata = "RESETMCI" */
+/*
+ * The code to reset MCI should put into TCM area
+ */
+/* __attribute__((section("RESETMCI"))) static void SYS_ResetMci(void)  */
+/* void SYS_ResetMci(void) __attribute__((section("RESETMCI"))); */
+__attribute__((section(".RESETMCI"))) __inline void SYS_ResetMci(void) 
+{
+    m_pGBL->GBL_REG_RST_EN[0] |= GBL_RST_MCI;
+    m_pGBL->GBL_SW_RST_EN[0]  =  GBL_RST_MCI;
+    m_pGBL->GBL_SW_RST_DIS[0] =  GBL_RST_MCI;
+    m_pGBL->GBL_REG_RST_EN[0] &= ~GBL_RST_MCI;
+}
+
+/* void SYS_ResetModules(void) __attribute__((section("RESETMCI"))); */
+__attribute__((section(".RESETMCI")))void SYS_ResetModules(void)
+{
+    OS_ENTER_CRITICAL();
+	// reset DMA
+	m_pGBL->GBL_REG_RST_EN[1] |= GBL_RST_DMA_R0;
+	m_pGBL->GBL_SW_RST_EN[1]  =  GBL_RST_DMA_R0;
+	m_pGBL->GBL_SW_RST_DIS[1] =  GBL_RST_DMA_R0;
+	m_pGBL->GBL_REG_RST_EN[1] &= ~GBL_RST_DMA_R0;
+
+	SYS_ResetMci();
+
+    OS_EXIT_CRITICAL();
+}
+/* #pragma arm section code, rwdata,  zidata */
+
+static void DRAM_Reset(MMP_USHORT usDelay)
+{
+    AITPS_DRAM  pDRAM = AITC_BASE_DRAM;
+    MMP_UBYTE   ubKeepDramSetting[4];
+
+    //reset DRAM
+    //Mercury workaround 0x6E91, 0x6E96, 0x6E9B, 0x6EA0 needs to set 0 before reset dram
+    ubKeepDramSetting[0] = pDRAM->DRAM_DDR_DQBLK0_CTL_OPT; // 6E91
+    ubKeepDramSetting[1] = pDRAM->DRAM_DDR_DQBLK1_CTL_OPT; // 6E96
+    ubKeepDramSetting[2] = pDRAM->DRAM_DDR_DQBLK2_CTL_OPT; // 6E9B
+    ubKeepDramSetting[3] = pDRAM->DRAM_DDR_DQBLK3_CTL_OPT; // 6EA0
+
+    pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0;
+    pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0;
+    pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0;
+    pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0;
+
+    pDRAM->DRAM_DFI_CTL |= (DRAM_RD_DIRTYDROP_EN | DRAM_SW_RST | DRAM_VLD_ST_EN);
+    MMPF_SYS_ResetHModule(MMPF_SYS_MDL_DRAM, MMP_FALSE);
+
+    pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = ubKeepDramSetting[0];
+    pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = ubKeepDramSetting[1];
+    pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = ubKeepDramSetting[2];
+    pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = ubKeepDramSetting[3];
+
+    //update DRAM macro delay
+    pDRAM->DRAM_DDR_CLK_MACRO_DLY = usDelay;
+    //re-initialize DRAM
+    MMPF_DRAM_SendInitCmd();
+    pDRAM->DRAM_DFI_CTL &= ~(DRAM_RD_DIRTYDROP_EN | DRAM_SW_RST | DRAM_VLD_ST_EN);
+}
+
+static MMP_BOOL DMA_CopyDramTest(MMP_ULONG src_addr, MMP_ULONG dst_addr, MMP_USHORT src_off, MMP_USHORT dst_off, MMP_ULONG length)
+{
+    #define DMA_TIMEOUT_TICK        (3) //in unit of ms
+
+    AITPS_DMA   pDMA = AITC_BASE_DMA;
+    AITPS_DMA_R pDMA_R;
+    MMP_ULONG   os_time;
+    AITPS_MCI pMCI  = AITC_BASE_MCI;
+
+    MMPF_SYS_EnableClock(MMPF_SYS_CLK_DMA, MMP_TRUE);
+
+	pDMA_R = &pDMA->DMA_R0;
+
+    //set src addr
+    pDMA_R->DMA_R_SRC_ADDR = src_addr;
+    //set src line offset
+    pDMA_R->DMA_R_SRC_OFST = src_off;
+
+    //set dst addr
+    pDMA_R->DMA_R_DST_ADDR = dst_addr;
+    //set dst line offset
+    pDMA_R->DMA_R_DST_OFST = dst_off;
+
+    //set width
+    pDMA_R->DMA_R_PIX_W = 16 - 1;
+    //set height
+    pDMA_R->DMA_R_PIX_H = (length >> 5) - 1;
+    //set blk size 16x16 and 16bpp, no rotate
+
+    pDMA_R->DMA_R_CTL = DMA_R_BLK_64X64 | DMA_R_BPP_16;
+
+    //no mirror
+    pDMA_R->DMA_R_MIRROR_EN = DMA_R_MIRROR_DISABLE;
+
+    //disable interrupt & clear status
+    pDMA->DMA_INT_CPU_EN &= ~(DMA_INT_R0_DONE);
+    pDMA->DMA_INT_CPU_SR = DMA_INT_R0_DONE;
+
+    pDMA->DMA_EN = DMA_R0_EN;
+
+    //wait till DMA done
+    os_time = OSTimeGet();
+    do {
+        if (pDMA->DMA_INT_CPU_SR & DMA_INT_R0_DONE)
+            break;
+        if ((OSTimeGet() - os_time) > DMA_TIMEOUT_TICK) {
+            //software reset DMA
+            #if (CHIP == MCR_V2)
+            SYS_ResetModules();
+            pMCI->MCI_EXTM_TYPE   = MCI_EXTM_DRAM;  // 0x7710
+            pMCI->MCI_FB_DRAM_CTL = MCI_RD_AFTER_WR_EN; // 0x7711
+            #endif
+
+            return MMP_FALSE;
+        }
+    } while(1);
+
+    pDMA->DMA_INT_CPU_SR |= DMA_INT_R0_DONE;
+    return MMP_TRUE;
+
+}
+
+static MMP_BOOL DMA_DramVerify(void)
+{
+    MMP_ULONG   i, src_ecc[2], dst_ecc[2];
+
+    //SRAM to DRAM
+    if (!DMA_CopyDramTest(m_DmaParam.ulSrcAddr, 0x01000000, 32, 36, m_DmaParam.ulSize))
+        return MMP_FALSE;
+
+    //DRAM to DRAM
+    if (!DMA_CopyDramTest(0x01000000, 0x01800000, 36, 36, m_DmaParam.ulSize))
+        return MMP_FALSE;
+
+    //DRAM to SRAM
+    if (!DMA_CopyDramTest(0x01800000, m_DmaParam.ulDstAddr, 36, 32, m_DmaParam.ulSize))
+        return MMP_FALSE;
+
+    for(i = 0; i < m_DmaParam.ulSize; i += 0x200) {
+        generate_ecc(m_DmaParam.ulSrcAddr + i, src_ecc);
+        generate_ecc(m_DmaParam.ulDstAddr + i, dst_ecc);
+        if ((src_ecc[0] != dst_ecc[0]) || (src_ecc[1] != dst_ecc[1])) {
+            return MMP_FALSE;
+        }
+    }
+
+    return MMP_TRUE;
+}
+
+MMP_BOOL DMA_SearchClkRange(MMP_USHORT  usLowBD,
+                            MMP_USHORT  usUpBD,
+                            MMP_UBYTE   ubStep,
+                            MMP_USHORT  *usClkRangeLow,
+                            MMP_USHORT  *usClkRangeHigh)
+{
+    MMP_USHORT  usDelay;
+    MMP_USHORT	usMinDly, usMaxDly, usLastPassDly = 0xFFFF;
+    MMP_USHORT	usPickedMinDly = 0xFFFF, usPickedMaxDly;
+    MMP_BOOL    bPass;
+
+    for (usDelay = usLowBD; usDelay < usUpBD; usDelay += ubStep) {
+        DRAM_Reset(usDelay);
+
+        bPass = DMA_DramVerify();
+        if (bPass) {
+            if (usLastPassDly == 0xFFFF) {
+                usMinDly = usDelay;
+            }
+            // a new delay range got to be started
+            else if (usDelay != (usLastPassDly + ubStep)) {
+                // that is the 1st range we have
+                if (usPickedMinDly == 0xFFFF) {
+                    usPickedMinDly = usMinDly;
+                    usPickedMaxDly = usMaxDly;
+                }
+                // we got a bigger delay range!
+                else if ((usPickedMaxDly - usPickedMinDly) < (usMaxDly - usMinDly)) {
+                    usPickedMinDly = usMinDly;
+                    usPickedMaxDly = usMaxDly;
+                }
+                //RTNA_DBG_Str(0, "# Scan range:");
+	            //RTNA_DBG_Short(0, usMinDly);
+	            //RTNA_DBG_Short(0, usMaxDly);
+	            //RTNA_DBG_Str(0, "\r\n");
+                usMinDly = usDelay;
+            }
+            usLastPassDly = usDelay;
+            usMaxDly = usDelay;
+        }
+    }
+
+    // check if the last delay range is the MAX one.
+    if (usLastPassDly != 0xFFFF) {
+        if (usPickedMinDly == 0xFFFF) {
+            usPickedMinDly = usMinDly;
+            usPickedMaxDly = usMaxDly;
+        }
+        else if ((usPickedMaxDly - usPickedMinDly) < (usMaxDly - usMinDly)) {
+            usPickedMinDly = usMinDly;
+            usPickedMaxDly = usMaxDly;
+        }
+
+        *usClkRangeLow  = usPickedMinDly;
+        *usClkRangeHigh = usPickedMaxDly;
+
+        return MMP_TRUE;
+    }
+
+    *usClkRangeLow  = 0;
+    *usClkRangeHigh = 0;
+
+    return MMP_FALSE;
+}
+
+#if 0
+void _____MCR_V2_DDR2_DDR3_____(){}
+#endif
+
+#if (DRAM_ID == DRAM_DDR2)||(DRAM_ID == DRAM_DDR3)
+#if !defined(ALL_FW)
+
+#if (AUTO_DLL_LOCK)
+#if (SETTING_FOR_DDR3_Q)
+static MMP_BOOL MMPF_DDR3_IsCandidate(  MMPF_DRAM_CHKDLYINFO    *cand,
+                                        MMPF_DRAM_CHKDLYINFO    *targ,
+                                        const MMP_USHORT        margin)
+{
+    MMP_ULONG cand_dly_win, targ_dly_win;
+
+    cand_dly_win = cand->usMAX_CLKDLY - cand->usMIN_CLKDLY;
+    targ_dly_win = targ->usMAX_CLKDLY - targ->usMIN_CLKDLY;
+
+    if ((cand_dly_win >= (targ_dly_win - margin)) &&
+        (cand->usMAX_CLKDLY >= (targ->usMAX_CLKDLY - margin)) &&
+        (cand->usMAX_CLKDLY <= (targ->usMAX_CLKDLY + margin)) &&
+        (cand->usMIN_CLKDLY >= (targ->usMIN_CLKDLY - margin)) &&
+        (cand->usMIN_CLKDLY <= (targ->usMIN_CLKDLY + margin)))
+    {
+        return MMP_TRUE;
+    }
+
+    return MMP_FALSE;
+}
+
+#if DDR3_Q_PATCH
+static void MMPF_DDR3_FindNewCandidates(  MMPF_DRAM_CHKDLYINFO  *info, MMP_ULONG  *pulidx_new_sel, MMP_ULONG  usa_num)
+{
+	MMP_LONG  i;
+	MMP_ULONG ulUPAccu = 0;
+	MMP_ULONG ulDWAccu = 0;
+	MMP_ULONG ulCLKDIF = 0;
+	MMP_ULONG ulDLYDIF = 0;
+	MMP_ULONG ulLOWBD = 0;
+	MMP_ULONG ulUPBD = 0;
+	/*
+	RTNA_DBG_Str(0,"\r\n**************************************\r\n");
+    for (i = 0; i < usa_num; i++) {
+        RTNA_DBG_Str(0,"DLY, min, max:");
+        RTNA_DBG_Short(0, info[i].usDQRD_DLY);
+        RTNA_DBG_Str(0,", ");
+        RTNA_DBG_Short(0, info[i].usMIN_CLKDLY);
+        RTNA_DBG_Str(0,", ");
+        RTNA_DBG_Short(0, info[i].usMAX_CLKDLY);
+        RTNA_DBG_Str(0,"\r\n");
+    }
+	RTNA_DBG_Str(0,"\r\n**************************************\r\n");
+    */
+    
+	//search up triangle area
+ 	for(i = 0;i <usa_num;i++){		
+		ulCLKDIF = ( ( (info[i].usMAX_CLKDLY) - (info[i].usMIN_CLKDLY) ) >> 3 ) + 1 ;		
+		if(i != (usa_num - 1) ){ 
+			if ( ( (info[i].usMAX_CLKDLY) >= (info[i+1].usMIN_CLKDLY) ) )
+				ulDLYDIF = (info[i+1].usDQRD_DLY)-(info[i].usDQRD_DLY);	
+			else {
+			    #if DDR3_Q_PATCH>=2
+				if(ulUPAccu >=5 ){
+					break;
+				}
+				else if( ((info[i].usMAX_CLKDLY) >= (info[i+2].usMIN_CLKDLY)) ) {
+					//for the 2nd time judge,make sure it's real turning-point
+					//enter if not real turning-point
+					ulUPAccu = 0;
+					continue;
+				}
+				else {
+    			    ulUPAccu = 0;
+    			    break ;
+				}
+				#else
+			    ulUPAccu = 0;
+			    break ;
+				#endif
+			}	
+		}
+		else  { //last member
+			ulDLYDIF = 2;
+		}
+		
+		if ( (ulCLKDIF >= 9)&&(ulDLYDIF == 2) ) { //9 block continue for left-up triangle		
+			if(ulUPAccu == 0)
+				ulLOWBD = i;	
+			
+			ulUPAccu++;		
+			ulUPBD = i;
+		}
+		else {
+			if(ulUPAccu >=5 ) {
+				break;
+			}	
+			else {
+				ulUPAccu = 0;
+				continue;
+			}
+		}			
+	}
+    #if DDR3_Q_PATCH>=2
+	gNewScanRangeTable.upper = info[ulUPBD];
+	gNewScanRangeTable.down  = info[ulLOWBD];
+    #endif
+	ubTriangleArea = 1;
+	if (ulUPAccu > 10){
+		*pulidx_new_sel = ulLOWBD + 4;			
+	}
+	else if ( (ulUPAccu >= 6)&&(ulUPAccu <= 10) ){
+		*pulidx_new_sel = ulLOWBD + 3;		
+	}
+	else if (ulUPAccu == 5){
+		*pulidx_new_sel = ulLOWBD + 2;	
+	}
+	else {
+		*pulidx_new_sel = 0xFFFFFFFF;
+	}
+	
+	//search down triangle area
+	if (*pulidx_new_sel == 0xFFFFFFFF) {
+		ulUPBD = 0;
+		ulLOWBD = 0;
+		for(i = (usa_num-1);i >= 0;i--){
+			ulCLKDIF = ( ( (info[i].usMAX_CLKDLY) - (info[i].usMIN_CLKDLY) ) >> 3 ) + 1 ;
+			if(i){ 
+				if ( ( (info[i].usMIN_CLKDLY) <= (info[i-1].usMAX_CLKDLY) ) ) {  // usMIN_CLKDLY   usMAX_CLKDLY
+					ulDLYDIF = (info[i].usDQRD_DLY)-(info[i-1].usDQRD_DLY);	
+				}
+				else {
+				    #if DDR3_Q_PATCH>=2
+					if(ulDWAccu >=3 ){
+						break;
+                    }
+					else if ( ( (info[i].usMIN_CLKDLY) <= (info[i-2].usMAX_CLKDLY) ) ) {
+						//for the 2nd time judge,make sure it's real turning-point
+						//enter if not real turning-point
+						ulDWAccu = 0;
+						continue;
+					}					
+                    else {
+                        ulDWAccu = 0;
+                        break;
+                    }				    
+				    #else
+					//ulDLYDIF = 0;//Turning point (info[i].usMAX_CLKDLY) < (info[i+1].usMIN_CLKDLY),ulDLYDIF = 0 is just a option for later judgement	
+					ulDWAccu = 0 ;
+					break;
+					#endif
+				}	
+			}
+			else  { //last member
+				ulDLYDIF = 2;
+			}
+
+			if ( (ulCLKDIF >= 8)&&(ulDLYDIF == 2) ) { //8 block continue for right-down triangle
+				if(ulDWAccu == 0)
+					ulUPBD = i;	
+				
+				ulDWAccu++;		
+				ulLOWBD = i;  
+			}
+			else {
+				if(ulDWAccu >=3 )
+					break;
+				else {
+					ulDWAccu = 0; 
+					continue;
+				}
+			}		
+		}
+		#if DDR3_Q_PATCH>=2
+		gNewScanRangeTable.upper = info[ulUPBD];
+		gNewScanRangeTable.down  = info[ulLOWBD];
+		
+		#endif
+		
+		ubTriangleArea = 2;
+		if (ulDWAccu >= 8){
+			*pulidx_new_sel = ulUPBD - 4;			
+		}
+		else if ( (ulDWAccu >= 5)&&(ulDWAccu <= 7) ){
+			*pulidx_new_sel = ulUPBD - 3;		
+		}
+		else if ( (ulDWAccu >= 3)&&(ulDWAccu < 5) ){
+			*pulidx_new_sel = ulUPBD - 2;	
+		}
+		else {
+			*pulidx_new_sel = 0xFFFFFFFF;
+			ubTriangleArea = 0;
+		}		
+	} //endif
+
+}
+#endif
+
+static void MMPF_DDR3_DebugViewCandidates(  MMPF_DRAM_CHKDLYINFO    *info,
+                                            DDR3_DLY_DEBUG          *dbg)
+{
+    MMP_ULONG i;
+
+    RTNA_DBG_Str(0,"idx, dly_range, min, max:");
+    RTNA_DBG_Byte(0, dbg->idx_opt);
+    RTNA_DBG_Short(0, info[dbg->idx_opt].usMAX_CLKDLY -
+                      info[dbg->idx_opt].usMIN_CLKDLY);
+    RTNA_DBG_Short(0, info[dbg->idx_opt].usMIN_CLKDLY);
+    RTNA_DBG_Short(0, info[dbg->idx_opt].usMAX_CLKDLY);
+    RTNA_DBG_Str(0,"\r\n");
+
+    for (i = 0; i < dbg->num; i++) {
+        RTNA_DBG_Str(0,"DLY, min, max:");
+        RTNA_DBG_Short(0, info[i].usDQRD_DLY);
+        RTNA_DBG_Str(0,", ");
+        RTNA_DBG_Short(0, info[i].usMIN_CLKDLY);
+        RTNA_DBG_Str(0,", ");
+        RTNA_DBG_Short(0, info[i].usMAX_CLKDLY);
+        RTNA_DBG_Str(0,"\r\n");
+    }
+
+    RTNA_DBG_Str(0,"Find suitable DLY, min, max:");
+    RTNA_DBG_Short(0, info[dbg->idx_sel].usDQRD_DLY);
+    RTNA_DBG_Str(0,", ");
+    RTNA_DBG_Short(0, info[dbg->idx_low].usDQRD_DLY);
+    RTNA_DBG_Str(0,", ");
+    RTNA_DBG_Short(0, info[dbg->idx_up].usDQRD_DLY);
+    RTNA_DBG_Str(0,"\r\n");
+}
+
+static MMP_USHORT MMPF_DDR3_SearchDataEyeDly(MMPF_DRAM_CHKDLYINFO   *pDlyInfo,
+                                            MMP_USHORT              *usMin,
+                                            MMP_USHORT              *usMax)
+{
+    MMP_ULONG i, dly_win;
+    MMP_ULONG idx_max_dly;  // the index of data eye with the max clk delay window
+    MMP_ULONG max_dly_win;  // the width of max clk delay window
+    MMP_ULONG usable_num;   // number of data eye delay who has clk delay window
+    MMP_ULONG idx_deye_lowbd, idx_deye_upbd, idx_deye_sel;
+    const MMP_ULONG margin = 0x18; // within the margin can be a candidate
+    
+    DDR3_DLY_DEBUG dbg_view;
+
+    /* Try to find the one who has the max. delay window */
+    usable_num = 0;
+    max_dly_win = 0;
+    for(i = 0; i < SEARCH_DQDLY_NUM; i++) {
+        dly_win = pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY;
+
+        if (dly_win > 0) {
+            usable_num++;
+            if (dly_win > max_dly_win) {
+                max_dly_win = dly_win;
+                idx_max_dly = i;
+            }
+        }
+    }
+
+    idx_deye_lowbd = idx_max_dly;
+    idx_deye_upbd = idx_max_dly;
+
+    /* To find the low bound of data eye candidates */
+    i = idx_max_dly;
+    do {
+        if (MMPF_DDR3_IsCandidate(&pDlyInfo[i], &pDlyInfo[idx_max_dly], margin))
+            idx_deye_lowbd = i;
+        else
+            break;
+
+        if (i > 0)
+            i--;
+        else
+            break;
+    } while(1);
+
+    /* To find the up bound of data eye candidates */
+    i = idx_max_dly;
+    do {
+        if (MMPF_DDR3_IsCandidate(&pDlyInfo[i], &pDlyInfo[idx_max_dly], margin))
+            idx_deye_upbd = i;
+        else
+            break;
+
+        i++;
+        if (i >= usable_num)
+            break;
+    } while(1);
+
+    /* Choose the optimize data eye delay */
+    idx_deye_sel = (idx_deye_upbd + idx_deye_lowbd) >> 1;
+    //if ((idx_deye_upbd - idx_deye_lowbd) >= 8)
+    //    idx_deye_sel += 1;
+
+    *usMin = pDlyInfo[idx_deye_lowbd].usDQRD_DLY;
+    *usMax = pDlyInfo[idx_deye_upbd].usDQRD_DLY;
+
+    dbg_view.idx_low    = idx_deye_lowbd;
+    dbg_view.idx_up     = idx_deye_upbd;
+    dbg_view.idx_opt    = idx_max_dly;
+    dbg_view.idx_sel    = idx_deye_sel;
+    dbg_view.num        = usable_num;
+    MMPF_DDR3_DebugViewCandidates(pDlyInfo, &dbg_view);
+
+    return pDlyInfo[idx_deye_sel].usDQRD_DLY;
+}
+
+static MMP_USHORT MMPF_DDR3_SearchWrLeveling(MMPF_DRAM_CHKDLYINFO   *pDlyInfo,
+                                            MMP_USHORT              *usMin,
+                                            MMP_USHORT              *usMax)
+{
+    MMP_ULONG i, dly_win;
+    MMP_ULONG idx_max_dly;  // the index of wr leveling with the max clk delay window
+    MMP_ULONG max_dly_win;  // the width of max clk delay window
+    MMP_ULONG usable_num;   // number of wr leveling who has clk delay window
+    MMP_ULONG idx_wrlv_lowbd, idx_wrlv_upbd, idx_wrlv_sel;
+    const MMP_ULONG margin = 0x18; // within the margin can be a candidate
+
+    DDR3_DLY_DEBUG dbg_view;
+
+    /* Try to find the one who has the max. delay window */
+    usable_num = 0;
+    max_dly_win = 0;
+    for(i = 0; i < SEARCH_DQDLY_NUM; i++) {
+        dly_win = pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY;
+
+        if (dly_win > 0) {
+            usable_num++;
+            if (dly_win > max_dly_win) {
+                max_dly_win = dly_win;
+                idx_max_dly = i;
+            }
+        }
+    }
+
+    idx_wrlv_lowbd = idx_max_dly;
+    idx_wrlv_upbd = idx_max_dly;
+
+    /* To find the low bound of data eye candidates */
+    i = idx_max_dly;
+    do {
+        if (MMPF_DDR3_IsCandidate(&pDlyInfo[i], &pDlyInfo[idx_max_dly], margin))
+            idx_wrlv_lowbd = i;
+        else
+            break;
+
+        if (i > 0)
+            i--;
+        else
+            break;
+    } while(1);
+
+    /* To find the up bound of data eye candidates */
+    i = idx_max_dly;
+    do {
+        if (MMPF_DDR3_IsCandidate(&pDlyInfo[i], &pDlyInfo[idx_max_dly], margin))
+            idx_wrlv_upbd = i;
+        else
+            break;
+
+        i++;
+        if (i >= usable_num)
+            break;
+    } while(1);
+
+    /* Choose the optimize wr leveling delay */
+    idx_wrlv_sel = (idx_wrlv_lowbd + idx_wrlv_upbd) >> 1;
+
+    *usMin = pDlyInfo[idx_wrlv_lowbd].usDQRD_DLY;
+    *usMax = pDlyInfo[idx_wrlv_upbd].usDQRD_DLY;
+
+    dbg_view.idx_low    = idx_wrlv_lowbd;
+    dbg_view.idx_up     = idx_wrlv_upbd;
+    dbg_view.idx_opt    = idx_max_dly;
+    dbg_view.idx_sel    = idx_wrlv_sel;
+    dbg_view.num        = usable_num;
+    MMPF_DDR3_DebugViewCandidates(pDlyInfo, &dbg_view);
+
+    return ((*usMin + *usMax) >> 1);
+    //return pDlyInfo[idx_wrlv_sel].usDQRD_DLY;
+}
+
+static MMP_USHORT MMPF_DDR3_SearchAsyncRd(  MMPF_DRAM_CHKDLYINFO   *pDlyInfo,
+                                            MMP_USHORT              *usMin,
+                                            MMP_USHORT              *usMax)
+{
+#if DDR3_Q_PATCH
+    MMP_ULONG idx_new_sel;  //the index of new selection
+#endif
+
+    MMP_ULONG i, dly_win;
+    MMP_ULONG idx_max_dly;  // the index of async rd with the max clk delay window
+    MMP_ULONG max_dly_win;  // the width of max clk delay window
+    MMP_ULONG usable_num;   // number of async rd dly who has clk delay window
+    MMP_ULONG idx_range_lowbd, idx_range_upbd;
+    MMP_ULONG idx_asrd_lowbd, idx_asrd_upbd, idx_asrd_sel;
+    MMP_ULONG lowbd, upbd;
+    const MMP_ULONG margin = 0x28; // within the margin can be a candidate
+    const MMP_ULONG cand_dly_win = 0x40; // delay window bigger than it can be a candidate
+
+    DDR3_DLY_DEBUG dbg_view;
+
+    /* Calculate the number of usable async read delays */
+    usable_num = 0;
+    for(i = 0; i < SEARCH_DQDLY_NUM; i++) {
+        dly_win = pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY;
+        if (dly_win > 0) {
+            usable_num++;
+        }
+    }
+
+    /* Try to find the max. range of async read with delay window >= 0x40 */
+    idx_range_lowbd = 0;
+    idx_range_upbd  = 0;
+    lowbd           = 0xFF;
+    upbd            = 0xFF;
+
+    for(i = 0; i < usable_num; i++) {
+        dly_win = pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY;
+        if (dly_win >= cand_dly_win) {
+            if (lowbd == 0xFF)
+                lowbd = i;
+
+            upbd = i;
+        }
+        else {
+            if ((upbd - lowbd) > (idx_range_upbd - idx_range_lowbd)) {
+                idx_range_lowbd = lowbd;
+                idx_range_upbd  = upbd;
+                
+                lowbd = 0xFF;
+                upbd  = 0xFF;
+            }
+            #if DDR3_Q_PATCH
+            else {
+                lowbd = 0xFF;
+                upbd  = 0xFF;
+            
+            }
+            #endif
+        }
+    }
+    if ((idx_range_lowbd == 0) && (idx_range_upbd == 0)) {
+        idx_range_lowbd = lowbd;
+        idx_range_upbd  = upbd;
+    }
+    else if ((upbd - lowbd) > (idx_range_upbd - idx_range_lowbd)) {
+        idx_range_lowbd = lowbd;
+        idx_range_upbd  = upbd;
+    }
+
+    /* Choose the optimize async read delay from the selected range */
+    max_dly_win = 0;
+    for(i = idx_range_lowbd; i <= idx_range_upbd; i++) {
+        // Find index with the max delay window
+        dly_win = pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY;
+        if (dly_win > max_dly_win) {
+            max_dly_win = dly_win;
+            idx_max_dly = i;
+        }
+    }
+
+    /* Update the low bound of async read candidates within the margin */
+    i = idx_max_dly;
+    do {
+        if (MMPF_DDR3_IsCandidate(&pDlyInfo[i], &pDlyInfo[idx_max_dly], margin))
+            idx_asrd_lowbd = i;
+        else
+            break;
+
+        if ((i > 0) && (i > idx_range_lowbd))
+            i--;
+        else
+            break;
+    } while(1);
+
+    /* To find the up bound of data eye candidates */
+    i = idx_max_dly;
+    do {
+        if (MMPF_DDR3_IsCandidate(&pDlyInfo[i], &pDlyInfo[idx_max_dly], margin))
+            idx_asrd_upbd = i;
+        else
+            break;
+
+        i++;
+        if (i > idx_range_upbd)
+            break;
+    } while(1);
+
+    idx_asrd_sel = (idx_asrd_lowbd + idx_asrd_upbd) >> 1;
+    #if DDR3_Q_PATCH
+	MMPF_DDR3_FindNewCandidates(pDlyInfo,&idx_new_sel,usable_num); 
+	if (idx_new_sel == 0xFFFFFFFF){
+	#if DDR3_Q_PATCH>=2
+	    gNewScanRangeTable.ulSkipScan = 0;
+	#endif
+		RTNA_DBG_Str(0,"\r\n Stop @ while(1),after new triangle search no result \r\n");
+		while(1);
+	}
+    #endif
+
+    *usMin = pDlyInfo[idx_asrd_lowbd].usDQRD_DLY;
+    *usMax = pDlyInfo[idx_asrd_upbd].usDQRD_DLY;
+
+    dbg_view.idx_low    = idx_asrd_lowbd;
+    dbg_view.idx_up     = idx_asrd_upbd;
+    #if DDR3_Q_PATCH==0
+    dbg_view.idx_sel    = idx_asrd_sel;
+    #else
+    dbg_view.idx_sel    = idx_new_sel; //NEW method
+    #endif
+    dbg_view.idx_opt    = idx_max_dly;
+    //dbg_view.idx_sel    = idx_asrd_sel;
+    dbg_view.num        = usable_num;
+    MMPF_DDR3_DebugViewCandidates(pDlyInfo, &dbg_view);
+    #if DDR3_Q_PATCH==0
+    return pDlyInfo[idx_asrd_sel].usDQRD_DLY;
+    #else
+    return pDlyInfo[idx_new_sel].usDQRD_DLY;    
+    #endif
+}
+
+static MMP_BOOL MMPF_DDR3_CheckAsyncRd( MMPF_DRAM_CHKDLYINFO   *pDlyInfo , MMP_USHORT num ,MMP_USHORT central_dly )
+{   
+#define SAFE_DLY_RANGE (0x40)
+    MMP_USHORT i ;
+    MMP_USHORT dly_range,min,max ;
+    for(i=0;i<num;i++) {
+		min = pDlyInfo[i].usMIN_CLKDLY;
+		max = pDlyInfo[i].usMAX_CLKDLY;
+		dly_range = pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY;
+        RTNA_DBG_Str(0,"DLY, min, max, range:");
+        RTNA_DBG_Short(0, pDlyInfo[i].usDQRD_DLY);
+        RTNA_DBG_Str(0,", ");
+        RTNA_DBG_Short(0, pDlyInfo[i].usMIN_CLKDLY);
+        RTNA_DBG_Str(0,", ");
+        RTNA_DBG_Short(0, pDlyInfo[i].usMAX_CLKDLY);
+        RTNA_DBG_Str(0,", ");
+        RTNA_DBG_Short(0, dly_range);
+        RTNA_DBG_Str(0,"\r\n");
+		if( pDlyInfo[i].usDQRD_DLY == central_dly ) {
+		    if( dly_range < SAFE_DLY_RANGE ) {
+		        return MMP_FALSE ;
+		    }
+		}
+    }
+    return MMP_TRUE ;
+}
+
+#else
+
+static MMP_USHORT MMPF_DDR3_SearchDlyInfo(  MMPF_DRAM_CHKDLYINFO    *pDlyInfo,
+                                            MMP_USHORT              *usMin,
+                                            MMP_USHORT              *usMax)
+{
+	MMP_USHORT  i, min, max, dly_range, dly_idx, diff_dly = 0x10;
+	MMP_USHORT  min_DQDly, max_DQDly;
+	MMP_USHORT  usDQRDDly = 0;
+	MMP_BOOL    bDBG_EN = MMP_TRUE;
+	MMP_USHORT  total = 0;
+	
+	min = 0;
+	max = 0;
+	dly_range = 0;
+	for (i = 0; i < SEARCH_DQDLY_NUM; i++) {
+		if ((pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY) > dly_range) {
+			min = pDlyInfo[i].usMIN_CLKDLY;
+			max = pDlyInfo[i].usMAX_CLKDLY;
+			dly_range = pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY;
+            dly_idx = i;
+		}
+        if ((pDlyInfo[i].usMAX_CLKDLY - pDlyInfo[i].usMIN_CLKDLY) > 0)
+            total++;
+	}
+    RTNA_DBG_Str(0,"idx, dly_range, min, max:");
+    RTNA_DBG_Byte(0, dly_idx);
+	RTNA_DBG_Short(0, dly_range);
+	RTNA_DBG_Short(0, min);
+	RTNA_DBG_Short(0, max);
+	RTNA_DBG_Str(0,"\r\n");
+
+    /* Find the low bound from the one has the largest range */
+    i = dly_idx;
+    min_DQDly = pDlyInfo[i].usDQRD_DLY;
+    while(1) {
+        MMPF_DRAM_CHKDLYINFO *info = &pDlyInfo[i];
+
+        if (((info->usMAX_CLKDLY - info->usMIN_CLKDLY) >= dly_range - diff_dly) &&
+            (info->usMAX_CLKDLY >= (max - diff_dly)) &&
+            (info->usMAX_CLKDLY <= (max + diff_dly)) &&
+            (info->usMIN_CLKDLY >= (min - diff_dly)) &&
+            (info->usMIN_CLKDLY <= (min + diff_dly)))
+            min_DQDly = info->usDQRD_DLY;
+        else
+            break;
+
+        if (i > 0)
+            i--;
+        else
+            break;
+    }
+
+    /* Find the up bound from the one has the largest range */
+    i = dly_idx;
+    max_DQDly = pDlyInfo[i].usDQRD_DLY;
+    while(1) {
+        MMPF_DRAM_CHKDLYINFO *info = &pDlyInfo[i];
+
+        if (((info->usMAX_CLKDLY - info->usMIN_CLKDLY) >= dly_range - diff_dly) &&
+            (info->usMAX_CLKDLY >= (max - diff_dly)) &&
+            (info->usMAX_CLKDLY <= (max + diff_dly)) &&
+            (info->usMIN_CLKDLY >= (min - diff_dly)) &&
+            (info->usMIN_CLKDLY <= (min + diff_dly)))
+            max_DQDly = info->usDQRD_DLY;
+        else
+            break;
+        i++;
+        if (i >= total)
+            break;
+    }
+
+    *usMin = min_DQDly;
+    *usMax = max_DQDly;
+	usDQRDDly = (max_DQDly + min_DQDly) / 2;
+
+	if (bDBG_EN) {
+		for (i = 0; i < total; i++) {
+			RTNA_DBG_Str(0,"DLY, min, max:");
+			RTNA_DBG_Short(0, pDlyInfo[i].usDQRD_DLY);
+			RTNA_DBG_Str(0,", ");
+			RTNA_DBG_Short(0, pDlyInfo[i].usMIN_CLKDLY);
+			RTNA_DBG_Str(0,", ");
+			RTNA_DBG_Short(0, pDlyInfo[i].usMAX_CLKDLY);
+			RTNA_DBG_Str(0,"\r\n");
+		}
+
+		RTNA_DBG_Str(0,"Find suitable DLY, min, max:");
+		RTNA_DBG_Short(0, usDQRDDly);
+		RTNA_DBG_Str(0,", ");
+		RTNA_DBG_Short(0, min_DQDly);
+		RTNA_DBG_Str(0,", ");
+		RTNA_DBG_Short(0, max_DQDly);
+		RTNA_DBG_Str(0,"\r\n");
+	}
+
+	return usDQRDDly;
+}
+#endif //(SETTING_FOR_DDR3_Q)
+
+static void MMPF_DDR3_ResetDlyInfo(MMPF_DRAM_CHKDLYINFO *pDlyInfo)
+{
+    MMP_ULONG i;
+
+    for (i = 0; i < SEARCH_DQDLY_NUM; i++) {
+		pDlyInfo[i].usDQRD_DLY   = 0;
+		pDlyInfo[i].usMIN_CLKDLY = 0;
+		pDlyInfo[i].usMAX_CLKDLY = 0;
+	}
+}
+#endif
+
+static MMP_USHORT MMPF_DDR3_BestInDlyInfo(  MMPF_DRAM_CHKDLYINFO    *pDlyInfo,
+                                            MMP_USHORT              delay)
+{
+#if (AUTO_DLL_LOCK)
+    MMP_ULONG  i;
+    MMP_USHORT best;
+
+    best = MMPF_DRAM_GetItem(DDR3_DELAY);
+    if(best > 0) {
+        return best ;
+    }
+    for (i = 0; i < SEARCH_DQDLY_NUM; i++) {
+        if (pDlyInfo[i].usDQRD_DLY == delay) {
+            break;
+        }
+        if (pDlyInfo[i].usDQRD_DLY > delay) {
+            i--;
+            break;
+        }
+    }
+    #if DDR3_Q_PATCH==0
+    best = (pDlyInfo[i].usMIN_CLKDLY + pDlyInfo[i].usMAX_CLKDLY) >> 1;
+    #else
+    if (ubTriangleArea == 1){
+		RTNA_DBG_Str(0,"Best range@ left-up triangle\r\n");
+		best = (ChkDlyInfo[i].usMIN_CLKDLY) + 0x20; //NEW method (0x20=4*8)choose the 5th from left
+    }
+	else if (ubTriangleArea == 2) {
+		RTNA_DBG_Str(0,"Best range@ right-down triangle\r\n");
+		best = (ChkDlyInfo[i].usMAX_CLKDLY) - 0x18; //NEW method (0x18=3*8)choose the 4th from right
+	}
+	else {
+		RTNA_DBG_Str(0,"\r\n Stop @ while(1),no triangle found \r\n");
+		while(1);
+	}
+        #if DDR3_Q_PATCH>=2
+    	gNewScanRangeTable.ulSkipScan = 0xEFCD3412;
+    	gNewScanRangeTable.usTriangle = ubTriangleArea;
+    	gNewScanRangeTable.usBestAsyncRd = delay;
+    	gNewScanRangeTable.usBestDLY =best ;
+        
+        #endif
+            
+    #endif
+    RTNA_DBG_Str(0, "+++++++++++++++++++++\r\n");
+    RTNA_DBG_Str(0, "# Final scan range: ");
+    RTNA_DBG_Short(0, pDlyInfo[i].usMIN_CLKDLY);
+    RTNA_DBG_Str(0, "~");
+    RTNA_DBG_Short(0, pDlyInfo[i].usMAX_CLKDLY);
+    RTNA_DBG_Str(0, " ->");
+    RTNA_DBG_Short(0, best);
+    RTNA_DBG_Str(0, "\r\n");
+    MMPF_DRAM_SetItem(DDR3_DELAY,best);
+    return best;
+
+#else
+    return 0x70;
+
+#endif
+}
+
+static MMP_USHORT MMPF_DDR3_ScanReadDQ(void)
+{
+#if (AUTO_DLL_LOCK)
+    AITPS_DRAM  pDRAM = AITC_BASE_DRAM;
+    MMP_UBYTE   idx;
+    MMP_USHORT  usDQRD_DLY, usMin, usMax;
+    MMP_USHORT	usMinDly, usMaxDly;
+    usDQRD_DLY = MMPF_DRAM_GetItem(DDR3_RDDQ);
+    if(usDQRD_DLY) {
+        return usDQRD_DLY ;
+    }
+
+    MMPF_DDR3_ResetDlyInfo(ChkDlyInfo);
+
+    idx = 0;
+    RTNA_DBG_Str(0, "==== DQ 1/4T Dly\r\n");
+    for (usDQRD_DLY = 0x20; usDQRD_DLY < 0xFF; usDQRD_DLY += 0x10) {
+        pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = usDQRD_DLY;
+		pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = usDQRD_DLY;
+
+        if (DMA_SearchClkRange(SEARCH_DLY_LOWBD, SEARCH_DLY_UPBD, SEARCH_DLY_STEP, &usMinDly, &usMaxDly)) {
+            ChkDlyInfo[idx].usDQRD_DLY   = usDQRD_DLY;
+            ChkDlyInfo[idx].usMIN_CLKDLY = usMinDly;
+            ChkDlyInfo[idx].usMAX_CLKDLY = usMaxDly;
+            idx++;
+            if (idx > SEARCH_DQDLY_NUM){
+                RTNA_DBG_Str(0, "Please add SEARCH_DQDLY_NUM value!!!");
+                MMPF_DRAM_InvalidSetting();
+                while (1);
+            }
+        }
+    }
+
+#if (SETTING_FOR_DDR3_Q)
+    usDQRD_DLY = MMPF_DDR3_SearchDataEyeDly(ChkDlyInfo, &usMin, &usMax);
+#else
+    usDQRD_DLY = MMPF_DDR3_SearchDlyInfo(ChkDlyInfo, &usMin, &usMax);
+#endif
+    MMPF_DRAM_SetItem(DDR3_RDDQ,usDQRD_DLY);
+    return usDQRD_DLY;
+
+#else
+    return 0x88;
+
+#endif
+}
+
+static MMP_USHORT MMPF_DDR3_ScanWrLvl(void)
+{
+#if (AUTO_DLL_LOCK)
+    MMP_UBYTE   idx;
+    MMP_USHORT  usWRLVLVal, usMin, usMax;
+    MMP_USHORT	usMinDly, usMaxDly;
+    AITPS_DRAM_DDR3 pDDR3 = AITC_BASE_DDR3;
+
+    usWRLVLVal = MMPF_DRAM_GetItem(DDR3_WRLVL );
+    if(usWRLVLVal > 0) {
+        return usWRLVLVal ;
+    }
+    MMPF_DDR3_ResetDlyInfo(ChkDlyInfo);
+
+    idx = 0;
+    RTNA_DBG_Str(0, "==== WR-LVL\r\n");
+    for (usWRLVLVal = 0x00; usWRLVLVal < 0xB0; usWRLVLVal += 0x10) {
+        pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L0 = usWRLVLVal >> 2; //305A
+        pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L1 = usWRLVLVal >> 2; //305B
+        pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xff;        //305F  - trigger
+
+        if (DMA_SearchClkRange(SEARCH_DLY_LOWBD, SEARCH_DLY_UPBD, SEARCH_DLY_STEP, &usMinDly, &usMaxDly)) {
+            ChkDlyInfo[idx].usDQRD_DLY   = usWRLVLVal;
+        	ChkDlyInfo[idx].usMIN_CLKDLY = usMinDly;
+        	ChkDlyInfo[idx].usMAX_CLKDLY = usMaxDly;
+        	idx++;
+        	if (idx > SEARCH_DQDLY_NUM){
+                RTNA_DBG_Str(0, "Please add SEARCH_DQDLY_NUM value!!!");
+                MMPF_DRAM_InvalidSetting();
+                while (1);
+        	}
+        }
+    }
+
+#if (SETTING_FOR_DDR3_Q)
+    usWRLVLVal = MMPF_DDR3_SearchWrLeveling(ChkDlyInfo, &usMin, &usMax);
+#else
+    usWRLVLVal = MMPF_DDR3_SearchDlyInfo(ChkDlyInfo, &usMin, &usMax);
+#endif
+    MMPF_DRAM_SetItem(DDR3_WRLVL,usWRLVLVal);
+    return usWRLVLVal;
+
+#else
+    return 0x58;
+
+#endif
+}
+
+static MMP_USHORT MMPF_DDR3_ScanAsyncRead(MMP_UBYTE bDQ)
+{
+#if (AUTO_DLL_LOCK)
+
+#if SETTING_FOR_DDR3_Q==1
+#define FINE_TUNE   (0)
+#else
+#define FINE_TUNE   (1)
+#endif
+
+    AITPS_DRAM  pDRAM = AITC_BASE_DRAM;
+    MMP_UBYTE   idx, ubLowBD, ubUpBD;
+    MMP_USHORT  usAsyncRd, usMin, usMax;
+    MMP_USHORT	usMinDly, usMaxDly;
+    MMP_USHORT  usAsyncRdBackup ;
+    
+    MMP_BOOL    save=MMP_TRUE ;
+
+    if(bDQ==0) {
+        usAsyncRd = MMPF_DRAM_GetItem(DDR3_ASYNCRD0);
+    }
+    else {
+        usAsyncRd = MMPF_DRAM_GetItem(DDR3_ASYNCRD1);
+    }
+    
+    if(usAsyncRd > 0) {
+    #if FINE_TUNE==0
+        RTNA_DBG_Str(0,"Using A-Read:") ;
+        RTNA_DBG_Byte(0,usAsyncRd );
+        RTNA_DBG_Str(0,"\r\n") ;
+        return usAsyncRd ;
+    #else
+        save=MMP_FALSE ;
+    #endif  
+        usAsyncRdBackup = usAsyncRd ; 
+    }
+retry:    
+    MMPF_DDR3_ResetDlyInfo(ChkDlyInfo);
+
+    idx = 0;
+    RTNA_DBG_Str(0, "==== Async Read\r\n");
+
+    if( !usAsyncRd )  { // full range
+    #if (SETTING_FOR_DDR3_Q)
+        ubLowBD = 0x06;
+        ubUpBD  = 0x25;
+    #else
+        ubLowBD = pDRAM->DRAM_DQBLK0_RD_QCDL_CTL;
+        ubUpBD  = ubLowBD + 0x14;
+        if (ubLowBD > 0x04)
+            ubLowBD -= 0x04;
+    #endif
+    } else {
+        // five points
+        ubUpBD = usAsyncRd + 0x05 ;
+        if(usAsyncRd > 0x04) {
+            ubLowBD = usAsyncRd - 0x04;
+        }
+        else if(usAsyncRd > 0x02) { 
+            ubLowBD = usAsyncRd - 0x02;
+        }
+        else {
+            ubLowBD = usAsyncRd  ;
+        }
+    }
+    for (usAsyncRd = ubLowBD; usAsyncRd < ubUpBD; usAsyncRd += 0x02) {
+        pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xA0;//6E91
+        pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xA0;//6E96
+        pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xA0;//6E9B
+        pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xA0;//6EA0
+
+#if (SETTING_FOR_DDR3_Q)
+        pDRAM->DRAM_DQBLK0_RDAS_CTL = usAsyncRd; //6e82
+        pDRAM->DRAM_DQBLK1_RDAS_CTL = usAsyncRd; //6e85
+#else
+        if (bDQ == 0)
+            pDRAM->DRAM_DQBLK0_RDAS_CTL = usAsyncRd; //6e82
+        else
+            pDRAM->DRAM_DQBLK1_RDAS_CTL = usAsyncRd; //6e85
+#endif
+
+        pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xAC;//6E91
+        pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xAC;//6E96
+        pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xAC;//6E9B
+        pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xAC;//6EA0
+
+        if (DMA_SearchClkRange(SEARCH_DLY_LOWBD, SEARCH_DLY_UPBD, SEARCH_DLY_STEP, &usMinDly, &usMaxDly)) {
+            ChkDlyInfo[idx].usDQRD_DLY   = usAsyncRd;
+            ChkDlyInfo[idx].usMIN_CLKDLY = usMinDly;
+            ChkDlyInfo[idx].usMAX_CLKDLY = usMaxDly;
+            idx++;
+            if (idx > SEARCH_DQDLY_NUM){
+                RTNA_DBG_Str(0, "Please add SEARCH_DQDLY_NUM value!!!");
+                MMPF_DRAM_InvalidSetting();
+                while (1);
+            }
+        }
+    }
+#if (SETTING_FOR_DDR3_Q)
+    if ( save ) {
+        usAsyncRd = MMPF_DDR3_SearchAsyncRd(ChkDlyInfo, &usMin, &usMax);
+    }
+    else {
+        usAsyncRd = usAsyncRdBackup ;
+        if( !MMPF_DDR3_CheckAsyncRd(ChkDlyInfo,5,usAsyncRd) ) {
+            usAsyncRd = 0 ;
+            save=MMP_TRUE ;
+            goto retry ;
+        }
+        RTNA_DBG_Str(0,"Using usAsyncRd:") ;
+        RTNA_DBG_Byte(0,usAsyncRd );
+        RTNA_DBG_Str(0,"\r\n") ;
+    }
+#else
+    usAsyncRd = MMPF_DDR3_SearchDlyInfo(ChkDlyInfo, &usMin, &usMax);
+#endif
+    if(save) {
+        if(bDQ==0) {
+            MMPF_DRAM_SetItem(DDR3_ASYNCRD0,usAsyncRd);
+        }
+        else {
+            MMPF_DRAM_SetItem(DDR3_ASYNCRD1,usAsyncRd);
+        }
+    }
+    return usAsyncRd;
+
+#else
+    if (bDQ == 0)
+        return 0x20;
+    else
+        return 0x20;
+#endif
+}
+#endif //!defined(ALL_FW)
+
+MMP_ERR MMPF_DRAM_ScanNewLockCore(MMPF_DRAM_TYPE dramtype, MMP_ULONG *ulSize, MMP_ULONG ulClock, MMPF_DRAM_MODE drammode)
+{
+	#if !defined(ALL_FW)
+    AITPS_DRAM  pDRAM = AITC_BASE_DRAM;
+    MMP_USHORT	ubIdx = 0, ubTableSize;
+    MMP_ULONG   ulFwStartAddr, ulFwEndAddr;
+    #endif
+    MMP_ERR     err;
+    AITPS_DRAM_DDR3 pDDR3 = AITC_BASE_DDR3;
+    MMP_USHORT  usDQRD_DLY, usWRLVLVal, ulASYNC_RD;
+
+    //initialize DRAM first for configuring pad, and DRAM OPRs.
+    err = MMPF_DRAM_Initialize(dramtype, ulSize, ulClock, drammode);
+
+#if defined(ALL_FW)
+	return MMP_ERR_NONE;
+#else
+
+	if (err != MMP_ERR_NONE)
+	    return err;
+
+    ubTableSize = sizeof(m_delayTable)/sizeof(m_delayTable[0]);
+    //find out the corresponding index in table for updating later
+    for (ubIdx = 0; ubIdx < ubTableSize; ubIdx++) {
+        if (m_delayTable[ubIdx].ubClock == (MMP_USHORT)ulClock)
+            break;
+    }
+    if (ubIdx == ubTableSize) {
+        //no match clock in the table
+        RTNA_DBG_Str(0, "Unsupported DRAM clock, check m_delayTable\r\n");
+        return MMP_DRAM_ERR_INITIALIZE;
+    }
+
+    #if defined(MBOOT_FW)
+    ulFwStartAddr   = (MMP_ULONG)&__RESET_START__;
+    ulFwEndAddr     = (MMP_ULONG)&__RESET_END__;
+    #endif
+    #if defined(UPDATER_FW)
+    //still not modify to gcc
+    ulFwStartAddr   = (MMP_ULONG)&Image$$ALL_SRAM$$Base;
+    ulFwEndAddr     = (MMP_ULONG)&Image$$ALL_SRAM$$ZI$$Limit;
+    #endif
+
+    m_DmaParam.ulSize   = ulFwEndAddr - ulFwStartAddr;
+    m_DmaParam.ulSize   = ((m_DmaParam.ulSize >> 9) << 9);  // 512 bytes align
+    if (m_DmaParam.ulSize > 0x2000)
+        m_DmaParam.ulSize = 0x2000;
+
+    m_DmaParam.ulSrcAddr = ALIGN4K(ulFwEndAddr);
+    m_DmaParam.ulDstAddr = ALIGN4K(m_DmaParam.ulSrcAddr + m_DmaParam.ulSize);
+
+	MMPF_SYS_EnableClock(MMPF_SYS_CLK_DMA, MMP_TRUE);	
+	MMPF_SYS_EnableClock(MMPF_SYS_CLK_SM, MMP_TRUE);
+
+    ////////////////////////////////////////
+    usDQRD_DLY = MMPF_DDR3_ScanReadDQ();
+    pDRAM->DRAM_DDR_DQBLK0_SYNC_DLY_TUNE = usDQRD_DLY;
+	pDRAM->DRAM_DDR_DQBLK1_SYNC_DLY_TUNE = usDQRD_DLY;
+
+    ////////////////////////////////////////
+    usWRLVLVal = MMPF_DDR3_ScanWrLvl();
+    pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L0 = usWRLVLVal >> 2; // 305A
+    pDDR3->DRAM_DDR3_AFE_WR_DQS_DH_L1 = usWRLVLVal >> 2; // 305B
+    pDDR3->DRAM_DDR3_AFE_RW_DLY_UPDATE_EN = 0xff;        // 305F  - trigger
+
+#if (SETTING_FOR_DDR3_Q)
+    ulASYNC_RD = MMPF_DDR3_ScanAsyncRead(0);
+    pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xA0;//6E91
+    pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xA0;//6E96
+    pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xA0;//6E9B
+    pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xA0;//6EA0
+
+    pDRAM->DRAM_DQBLK0_RDAS_CTL = ulASYNC_RD; //6e82
+    pDRAM->DRAM_DQBLK1_RDAS_CTL = ulASYNC_RD; //6e85
+
+    pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xAC;//6E91
+    pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xAC;//6E96
+    pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xAC;//6E9B
+    pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xAC;//6EA0
+#else
+	////////////////////////////////////////
+	ulASYNC_RD = MMPF_DDR3_ScanAsyncRead(0);
+    pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xA0;//6E91
+    pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xA0;//6E96
+    pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xA0;//6E9B
+    pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xA0;//6EA0
+
+    pDRAM->DRAM_DQBLK0_RDAS_CTL = ulASYNC_RD; //6e82
+
+    pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xAC;//6E91
+    pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xAC;//6E96
+    pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xAC;//6E9B
+    pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xAC;//6EA0
+
+    ////////////////////////////////////////
+	ulASYNC_RD = MMPF_DDR3_ScanAsyncRead(1);
+    pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xA0;//6E91
+    pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xA0;//6E96
+    pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xA0;//6E9B
+    pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xA0;//6EA0
+
+    pDRAM->DRAM_DQBLK1_RDAS_CTL = ulASYNC_RD; //6e85
+
+    pDRAM->DRAM_DDR_DQBLK0_CTL_OPT = 0xAC;//6E91
+    pDRAM->DRAM_DDR_DQBLK1_CTL_OPT = 0xAC;//6E96
+    pDRAM->DRAM_DDR_DQBLK2_CTL_OPT = 0xAC;//6E9B
+    pDRAM->DRAM_DDR_DQBLK3_CTL_OPT = 0xAC;//6EA0
+#endif
+
+    m_delayTable[ubIdx].usDelay = MMPF_DDR3_BestInDlyInfo(ChkDlyInfo, ulASYNC_RD);
+
+    // re-initialize DRAM with picked clk delay
+    DRAM_Reset(m_delayTable[ubIdx].usDelay);
+
+    RTNA_DBG_Str(0, "+++++++++++++++++++++\r\n");
+    RTNA_DBG_Str(0, "# Final delay:");
+    RTNA_DBG_Short(0, pDRAM->DRAM_DDR_CLK_MACRO_DLY);
+    RTNA_DBG_Str(0, "\r\n");
+    RTNA_DBG_Str(0, "+++++++++++++++++++++\r\n");
+
+    if (ulClock == 400) {
+    	#if (DRAM_ID == DRAM_DDR3)
+    	// do Gate-Training for final clock-delay
+	    MMPF_DRAM_GateTrainingCalibration();
+	    pDRAM->DRAM_DDR_DQBLK0_RG_CTL = 0x01;          //6eC4
+		pDRAM->DRAM_DDR_DQBLK1_RG_CTL = 0x01;          //6eCC
+		// Fix DDR3 bug
+		pDDR3->DRAM_DDR3_RDL_GATE_INIT_HIGH |= 0x02; // 0x3066
+    	#endif
+    }
+#endif //defined(ALL_FW)
+
+    MMPF_SYS_EnableClock(MMPF_SYS_CLK_SM, MMP_FALSE);
+
+    return MMP_ERR_NONE;
+}
+#endif // #if (DRAM_ID == DRAM_DDR3)
+
+#if 0 // for IDE function name list by section
+void _____MCR_V2_DDR_____(){}
+#endif
+
+#if (DRAM_ID == DRAM_DDR)
+MMP_ERR MMPF_DRAM_ScanNewLockCore(MMPF_DRAM_TYPE dramtype, MMP_ULONG *ulSize, MMP_ULONG ulClock, MMPF_DRAM_MODE drammode)
+{
+    AITPS_DRAM  pDRAM = AITC_BASE_DRAM;
+    MMP_USHORT	usMinDly, usMaxDly, usLowBD, usUpBD;
+    MMP_USHORT	usPickedMinDly, usPickedMaxDly;
+    MMP_USHORT	ubIdx, ubTableSize;
+    MMP_ERR     err;
+    MMP_ULONG   ulFwStartAddr, ulFwEndAddr;
+
+    //initialize DRAM first for configuring pad, and DRAM OPRs.
+    err = MMPF_DRAM_Initialize(dramtype, ulSize, ulClock, drammode);
+    if (err != MMP_ERR_NONE)
+	    return err;
+
+    ubTableSize = sizeof(m_delayTable)/sizeof(m_delayTable[0]);
+    //find out the corresponding index in table for updating later
+    for (ubIdx = 0; ubIdx < ubTableSize; ubIdx++) {
+        if (m_delayTable[ubIdx].ubClock == (MMP_USHORT)ulClock)
+            break;
+    }
+    if (ubIdx == ubTableSize) {
+        //no match clock in the table
+        RTNA_DBG_Str(0, "Unsupported DRAM clock, check m_delayTable\r\n");
+        return MMP_DRAM_ERR_INITIALIZE;
+    }
+
+    #if defined(MBOOT_FW)
+    extern unsigned char* __RESET_START__;
+    extern unsigned char* __RESET_END__;
+    ulFwStartAddr = (int) & __RESET_START__; 
+    ulFwEndAddr= (int) & __RESET_END__;
+    #endif
+    #if defined(UPDATER_FW)
+    extern unsigned char* __SRAM__START__;
+    extern unsigned char* __SRAM__END__;
+    ulFwStartAddr =  (MMP_ULONG) & __SRAM__START__;
+    ulFwEndAddr = (MMP_ULONG) & __SRAM__END__;
+    #endif
+
+    m_DmaParam.ulSize   = ulFwEndAddr - ulFwStartAddr;
+    m_DmaParam.ulSize   = ((m_DmaParam.ulSize >> 9) << 9);  // 512 bytes align
+    if (m_DmaParam.ulSize > 0x2000)
+        m_DmaParam.ulSize = 0x2000;
+
+    m_DmaParam.ulSrcAddr = ALIGN4K(ulFwEndAddr);
+    m_DmaParam.ulDstAddr = ALIGN4K(m_DmaParam.ulSrcAddr + m_DmaParam.ulSize);
+
+    MMPF_SYS_EnableClock(MMPF_SYS_CLK_DMA, MMP_TRUE);	
+	MMPF_SYS_EnableClock(MMPF_SYS_CLK_SM, MMP_TRUE);
+
+    DMA_CopyDramTest(ulFwStartAddr, m_DmaParam.ulSrcAddr, 32, 32, m_DmaParam.ulSize);
+
+    // search the clock delay range with coarse step first
+    if (DMA_SearchClkRange(SEARCH_DLY_LOWBD, SEARCH_DLY_UPBD, SEARCH_DLY_STEP, &usMinDly, &usMaxDly)) {
+        usPickedMinDly = usMinDly;
+        usPickedMaxDly = usMaxDly;
+    }
+    else {
+        RTNA_DBG_Str(0, "No delay range found\r\n");
+        goto _finish_scan;
+    }
+    // search lower part of clock delay range with fine step
+    usLowBD = (usPickedMinDly > (SEARCH_DLY_STEP - SEARCH_DLY_SUB_STEP)) ?
+              (usPickedMinDly - SEARCH_DLY_STEP + SEARCH_DLY_SUB_STEP) : 0;
+    usUpBD  = usPickedMinDly;
+    if (DMA_SearchClkRange(usLowBD, usUpBD, SEARCH_DLY_SUB_STEP, &usMinDly, &usMaxDly)) {
+        if ((usMinDly < usPickedMinDly) &&
+            (usMaxDly == (usPickedMinDly - SEARCH_DLY_SUB_STEP)))
+            usPickedMinDly = usMinDly; // update lower bound of delay range
+    }
+    // search upper part of clock delay range with fine step
+    usLowBD = usPickedMaxDly + SEARCH_DLY_SUB_STEP;
+    if (usLowBD > SEARCH_DLY_UPBD) {
+        usLowBD = SEARCH_DLY_UPBD;
+        usUpBD  = SEARCH_DLY_UPBD;
+    }
+    else {
+        usUpBD = usPickedMaxDly + SEARCH_DLY_STEP;
+        if (usUpBD > SEARCH_DLY_UPBD)
+            usUpBD  = SEARCH_DLY_UPBD;
+    }
+    if (DMA_SearchClkRange(usLowBD, usUpBD, SEARCH_DLY_SUB_STEP, &usMinDly, &usMaxDly)) {
+        if ((usPickedMaxDly < usMaxDly) &&
+            (usMinDly == (usPickedMaxDly + SEARCH_DLY_SUB_STEP)))
+            usPickedMaxDly = usMaxDly; // update upper bound of delay range
+    }
+
+    m_delayTable[ubIdx].usDelay = (usPickedMinDly + usPickedMaxDly) >> 1;
+
+_finish_scan:
+
+    MMPF_SYS_EnableClock(MMPF_SYS_CLK_SM, MMP_FALSE);
+
+    // re-initialize DRAM with picked clk delay
+    DRAM_Reset(m_delayTable[ubIdx].usDelay);
+
+    RTNA_DBG_Str(0, "# Final delay (");
+    RTNA_DBG_Short(0, usPickedMinDly);
+    RTNA_DBG_Str(0, " -");
+    RTNA_DBG_Short(0, usPickedMaxDly);
+    RTNA_DBG_Str(0, "):");
+    RTNA_DBG_Short(0, pDRAM->DRAM_DDR_CLK_MACRO_DLY);
+    RTNA_DBG_Str(0, "\r\n");
+    
+    #if (MCR_V2_UNDER_DBG)
+    // Some chips will be occurred for MCR_V2_MP, solution is Read dram data after 
+    // scanning clock delay range. 
+    RTNA_DBG_Long(0, *(volatile unsigned int *)0x1000000);
+    RTNA_DBG_Str(0, ": read dram\r\n");
+    #endif
+
+    return MMP_ERR_NONE;
+}
+#endif // #if (DRAM_ID == DRAM_DDR || DRAM_ID == DRAM_DDR2)
+
+#endif // defined(MBOOT_FW)||defined(UPDATER_FW)
+#endif // (AUTO_DRAM_LOCKCORE)
+
+/// @}
+/// @end_ait_only

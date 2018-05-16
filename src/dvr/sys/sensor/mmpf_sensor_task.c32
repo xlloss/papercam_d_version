@@ -1,0 +1,76 @@
+//==============================================================================
+//
+//  File        : sensor_task.c32
+//  Description : SENSOR function
+//  Author      : Jerry Tsao
+//  Revision    : 1.0
+//
+//==============================================================================
+
+//==============================================================================
+//
+//                              INCLUDE FILE
+//
+//==============================================================================
+
+#include "includes_fw.h"
+#if (SENSOR_EN)
+#include "lib_retina.h"
+
+//==============================================================================
+//
+//                              GLOBAL VARIABLES
+//
+//==============================================================================
+
+/** @addtogroup MMPF_Sensor
+@{
+*/
+
+OS_STK SENSOR_Task_Stk[TASK_SENSOR_STK_SIZE];
+
+#if (HANDLE_LDC_EVENT_BY_TASK)
+OS_STK LDC_Ctl_Task_Stk[TASK_LDC_CTL_STK_SIZE];
+#endif
+
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+extern void MMPF_Sensor_Task(void);
+#if (HANDLE_LDC_EVENT_BY_TASK)
+extern void MMPF_LDC_Ctl_Task(void);
+#endif
+
+//==============================================================================
+//
+//                              FUNCTIONS
+//
+//==============================================================================
+
+//------------------------------------------------------------------------------
+//  Function    : MMPF_SENSOR_TaskHandler
+//  Description : Task entry function for SENSOR
+//------------------------------------------------------------------------------
+
+void MMPF_SENSOR_TaskHandler(void *p_arg)
+{
+    MMPF_Sensor_Task();
+}
+
+#if (HANDLE_LDC_EVENT_BY_TASK)
+//------------------------------------------------------------------------------
+//  Function    : MMPF_LDC_Ctl_TaskHandler
+//  Description : Task entry function for LDC
+//------------------------------------------------------------------------------
+void MMPF_LDC_Ctl_TaskHandler(void *p_arg)
+{
+    MMPF_LDC_Ctl_Task();
+}
+#endif
+
+#endif
+
+/// @}

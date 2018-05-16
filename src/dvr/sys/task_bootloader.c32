@@ -1,0 +1,67 @@
+//*----------------------------------------------------------------------------
+//* The software is delivered "AS IS" without warranty or condition of any
+//* kind, either express, implied or statutory. This includes without
+//* limitation any warranty or condition with respect to merchantability or
+//* fitness for any particular purpose, or against the infringements of
+//* intellectual property rights of others.
+//*----------------------------------------------------------------------------
+
+#include "all_fw.h" 
+#include "includes_fw.h"
+#include "lib_retina.h"
+
+//==============================================================================
+//
+//                              CONSTANT
+//
+//==============================================================================
+
+#define BOOT_LOADER_TASK_PRIO       (50)
+#define BOOT_LOADER_STK_SIZE        (1024)
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+
+OS_STK  BootLoader_Task_Stk[BOOT_LOADER_STK_SIZE];
+
+//==============================================================================
+//
+//                              FUNCTIONS
+//
+//==============================================================================
+//------------------------------------------------------------------------------
+//  Function    : CE_JOB_DISPATCH_Task_Entry
+//  Description : Task entry function for FS function
+//------------------------------------------------------------------------------
+void BootLoader_Task(void *p_arg);
+
+void BootLoader_TaskHandler(void *p_arg)
+{
+    BootLoader_Task(p_arg);
+}
+
+/** @addtogroup BSP
+@{
+*/
+
+//*----------------------------------------------------------------------------
+//* \fn    MMPF_SWPACK_TaskInit
+//* \brief Application specific MMU configurations for SRAM and DRAM
+//*----------------------------------------------------------------------------
+void MMPF_SWPACK_TaskInit()
+{
+    MMPF_TASK_CFG   task_cfg;
+
+    MMPF_MMU_Initialize((MMP_ULONG *)MMU_TRANSLATION_TABLE_ADDR,
+                        (MMP_ULONG *)MMU_COARSEPAGE_TABLE_ADDR);
+
+    task_cfg.ubPriority = BOOT_LOADER_TASK_PRIO;
+    task_cfg.pbos = (MMP_ULONG)&BootLoader_Task_Stk[0];
+    task_cfg.ptos = (MMP_ULONG)&BootLoader_Task_Stk[BOOT_LOADER_STK_SIZE-1];
+    MMPF_OS_CreateTask(BootLoader_TaskHandler, &task_cfg, (void *)"BOOTL");
+    MMPF_OS_SetTaskName(task_cfg.ubPriority, (INT8U *)"BOOTLOAD");
+}
+/** @} */ /* End of BSP */

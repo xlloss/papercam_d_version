@@ -1,0 +1,158 @@
+//==============================================================================
+//
+//  File        : main_miniboot.c32
+//  Description : Main entry function of mini-boot
+//  Author      : Alterman
+//  Revision    : 1.0
+//
+//==============================================================================
+
+#include "includes_fw.h"
+#include "lib_retina.h"
+#include "lib_arm920t.h"
+#include "mmpf_pll.h"
+
+/** @addtogroup MMPF_SYS
+@{
+*/
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+extern void MiniBoot_Task(void);
+
+//==============================================================================
+//
+//                              MACRO DEFINITIONS
+//
+//==============================================================================
+
+//==============================================================================
+//
+//                              FUNCTIONS
+//
+//==============================================================================
+
+//------------------------------------------------------------------------------
+//  Function    : main
+//  Description : This is the standard entry point for C and CRT
+//                initialization is done before calling main()
+//------------------------------------------------------------------------------
+extern unsigned char *__bss_start__;
+extern unsigned char *__bss_end__;
+
+
+static void bss_zero_init()
+{
+        memset(&__bss_start__, 0, (int)&__bss_end__ - (int)&__bss_start__);
+}
+
+extern unsigned int* ___FlashToItcmFlashCodeStart;
+extern unsigned int* ___FlashToItcmFlashCodeEnd;
+extern unsigned int* ___FlashToItcmRamRegionStart;
+
+int main (void)
+{
+    int ItcmSize;
+    ItcmSize = (int)&___FlashToItcmFlashCodeEnd - (int)&___FlashToItcmFlashCodeStart;
+    memcpy(&___FlashToItcmRamRegionStart, &___FlashToItcmFlashCodeStart, ItcmSize);
+    bss_zero_init();
+    AITPS_GBL pGBL = AITC_BASE_GBL;
+    MMP_ULONG ulModSwRst[2];
+
+    //*(volatile MMP_UBYTE *)0x80006940 |= 0x01;
+    //*(volatile MMP_UBYTE *)0x80006600 |= 0x01;
+    //*(volatile MMP_UBYTE *)0x80006610 &= ~(0x01);
+
+    // Turn on all clock
+    pGBL->GBL_CLK_EN[0] = GBL_CLK_ALL0;
+    pGBL->GBL_CLK_EN[1] = GBL_CLK_ALL1;
+
+    // For better CPU performance
+    pGBL->GBL_MISC_CTL |= TWO_STAGE_SYNC;
+    pGBL->GBL_MISC_CTL1 |= (CPUA_SYNC_HS_EN | CPUB_SYNC_HS_EN);
+
+    // Disable the critical path inside CPU
+    AT91F_ARM_DisableBlkLevelClkGating();
+
+    // Reset modules
+    ulModSwRst[0] = GBL_RST_VIF0 | GBL_RST_VIF1 |
+                    GBL_RST_RAW_S0 | GBL_RST_RAW_S1 |
+                    GBL_RST_RAW_F | GBL_RST_ISP |
+                    GBL_RST_SCAL0 | GBL_RST_SCAL1 |
+                    GBL_RST_SCAL2 | GBL_RST_SCAL3 |
+                    GBL_RST_ICON0 | GBL_RST_ICON1 |
+                    GBL_RST_ICON2 | GBL_RST_ICON3 |
+                    GBL_RST_IBC0 | GBL_RST_IBC1|
+                    GBL_RST_IBC2 | GBL_RST_IBC3 |
+                    GBL_RST_DSPY | GBL_RST_DRAM |
+                    GBL_RST_H264 | GBL_RST_JPG;
+    ulModSwRst[1] = GBL_RST_CPU_PHL | GBL_RST_GRA |
+                    GBL_RST_USB | GBL_RST_SCAL4 |
+                    GBL_RST_ICON4 | GBL_RST_IBC4;
+
+    pGBL->GBL_REG_RST_EN[0] = ulModSwRst[0];
+    pGBL->GBL_REG_RST_EN[1] = ulModSwRst[1];
+    pGBL->GBL_SW_RST_EN[0]  = ulModSwRst[0];
+    pGBL->GBL_SW_RST_EN[1]  = ulModSwRst[1];
+    pGBL->GBL_SW_RST_DIS[0] = ulModSwRst[0];
+    pGBL->GBL_SW_RST_DIS[1] = ulModSwRst[1];
+    pGBL->GBL_REG_RST_EN[0] &= ~(ulModSwRst[0]);
+    pGBL->GBL_REG_RST_EN[1] &= ~(ulModSwRst[1]);
+
+    MMPF_BSP_Initialize();  // Initialize BSP functions
+    MMPF_PLL_Initialize();
+
+    MiniBoot_Task();
+    return 0;
+}
+
+//------------------------------------------------------------------------------
+//  Function    : __initial_stackheap
+//  Description : This is the default stack/heap initialization function
+//------------------------------------------------------------------------------
+#ifndef __GNUC__
+#pragma import (__use_no_semihosting_swi)
+
+#include <rt_misc.h>
+
+extern unsigned int Load$$TCM_END$$Base;
+extern unsigned int Image$$ALL_DRAM$$ZI$$Limit;
+
+__value_in_regs struct __initial_stackheap
+__user_initial_stackheap(unsigned R0, unsigned SP, unsigned R2, unsigned SL)
+{
+    struct __initial_stackheap config;
+
+    config.stack_base = (unsigned int)&Load$$TCM_END$$Base; // the end address of TCM
+    config.heap_base = (unsigned int)&Image$$ALL_DRAM$$ZI$$Limit;
+
+    return config;
+}
+#endif
+
+
+void _sys_exit(int return_code)
+{
+
+}
+
+void _ttywrch(int ch)
+{
+
+}
+
+void __assert(const char *expr, const char *file, int line)
+{
+}
+
+/// @}

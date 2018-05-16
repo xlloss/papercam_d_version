@@ -1,0 +1,57 @@
+//==============================================================================
+//
+//  File        : mmpf_iva_task.c32
+//  Description : Intelligent Video Analysis task entry function
+//  Author      : Alterman
+//  Revision    : 1.0
+//
+//==============================================================================
+
+#include "includes_fw.h"
+#if (SUPPORT_MDTC) || (SUPPORT_IVA)// || ...
+#include "lib_retina.h"
+
+//==============================================================================
+//
+//                              VARIABLES
+//
+//==============================================================================
+
+#if (SUPPORT_MDTC)
+OS_STK  MDTC_Task_Stk[MDTC_STK_SIZE];
+#endif
+#if (SUPPORT_IVA)
+OS_STK  IVA_Task_Stk[IVA_STK_SIZE] ;
+#endif
+//==============================================================================
+//
+//                              FUNCTION PROTOTYPES
+//
+//==============================================================================
+
+#if (SUPPORT_MDTC)
+extern void MMPF_MD_Task(void);
+#endif
+#if (SUPPORT_IVA)
+extern void MMPF_IVA_Task(void) ;
+#endif
+//------------------------------------------------------------------------------
+//  Function    : MMPF_MDTC_TaskHandler
+//  Description : Task entry function for Motion Detection
+//------------------------------------------------------------------------------
+#if (SUPPORT_MDTC)
+void MMPF_MDTC_TaskHandler(void *p_arg)
+{
+    MMPF_MD_Task();
+}
+#endif
+
+#if (SUPPORT_IVA)
+void MMPF_IVA_TaskHandler(void *p_arg)
+{
+    MMPF_IVA_Task();
+}
+#endif
+
+
+#endif // (SUPPORT_MDTC) || ...
