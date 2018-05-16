@@ -1141,8 +1141,12 @@ MMP_ERR MMPF_Sensor_LinkFunctionTable(void)
 MMP_ERR MMPF_Sensor_Wait3AConverge(MMP_UBYTE ubSnrSel)
 {
     MMP_ULONG ulframeCnt = 0;
+    printc("%s %d\r\n", __func__, __LINE__);
     do {
         MMPF_Sensor_GetParam(ubSnrSel, MMPF_SENSOR_ISP_FRAME_COUNT, &ulframeCnt);
+
+        printc("%s %d ulframeCnt=%d\r\n", __func__, __LINE__, ulframeCnt);
+
 #ifdef PROJECT_LD
         if ((ulframeCnt >= MIN_AE_CONVERGE_FRAME_NUM) && (1))
 #else
@@ -1157,10 +1161,12 @@ MMP_ERR MMPF_Sensor_Wait3AConverge(MMP_UBYTE ubSnrSel)
             
             break;
         }
+        printc("%s %d\r\n", __func__, __LINE__);
         MMPF_OS_Sleep(5); // for 120fps, the delay time should less than 8ms
     } while (ulframeCnt <= MAX_AE_CONVERGE_FRAME_NUM);
     
-    
+    printc("%s MAX_AE_CONVERGE_FRAME_NUM = %d\r\n", __func__, MAX_AE_CONVERGE_FRAME_NUM);
+    printc("%s ulframeCnt = %d\r\n", __func__, ulframeCnt);
     // SEAN : 20170510 , slow down AE 
     //gsSensorFunction->MMPF_Sensor_Switch3ASpeed( ubSnrId , MMP_TRUE );
     

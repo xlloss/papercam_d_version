@@ -145,8 +145,11 @@ MMPS_JSTREAM_CLASS *MMPS_JStream_Open(MMPS_JSTREAM_PROPT *propt)
     MMP_ULONG cand_frm_size = 0, cand_buf_size = 0;
     MMPS_JSTREAM_CLASS *obj = NULL;
 
+    printc("%s %d\r\n", __func__, __LINE__);
+
     if (!propt)
     	return NULL;
+    printc("%s %d\r\n", __func__, __LINE__);
 
     req_frm_size = ALIGN16(propt->w) * ALIGN16(propt->h);
     req_buf_size = propt->bufsize;
@@ -186,7 +189,7 @@ MMPS_JSTREAM_CLASS *MMPS_JStream_Open(MMPS_JSTREAM_PROPT *propt)
         printc("JStream open err\r\n");
         return NULL;
     }
-
+    printc("%s jstreamer ID %d\r\n", __func__, obj->id);
     /* Assign pipe resource */
     pipe = MMPD_Fctl_AllocatePipe(ALIGN16(propt->w), PIPE_LINK_JPG);
     if (pipe > MMP_IBC_PIPE_MAX) {
@@ -555,7 +558,7 @@ static MMP_ERR MMPS_JStream_OpenEncoder(MMPS_JSTREAM_CLASS *obj)
 {
     MMP_ULONG           width, height;
     MMPS_JSTREAM_PROPT  *propt = &obj->propt;
-
+    printc("%s %d\r\n", __func__, __LINE__);
     width  = ALIGN8(propt->w);
     height = ALIGN8(propt->h);
 
@@ -570,31 +573,42 @@ static MMP_ERR MMPS_JStream_OpenEncoder(MMPS_JSTREAM_CLASS *obj)
         MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_FALSE);
         return MMP_JSTREAM_ERR_BUF;
     }
-
+    printc("%s %d\r\n", __func__, __LINE__);
     MMPS_JStream_ConfigPipe(obj);
+    printc("%s %d\r\n", __func__, __LINE__);
     if (MMPS_JStream_EnablePipe(obj, MMP_TRUE) != MMP_ERR_NONE) {
 		printc("Enable Jpeg pipe: Fail\r\n");
         return MMP_JSTREAM_ERR_PIPE;
     }
 
     /* Configure encoder */
+    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetJpegResol(width, height, MMP_DSC_JPEG_RC_ID_CAPTURE);
+
+    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetJpegQualityCtl( MMP_DSC_JPEG_RC_ID_CAPTURE,
                                 MMP_FALSE,
                                 MMP_TRUE,
 			                    obj->propt.size,
 			                    (obj->propt.size * 5) >> 2,
 			                    1);
+
+    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetQTableInfo( MMP_DSC_JPEG_RC_ID_CAPTURE,
                             (MMP_UBYTE *)&m_Qtable[0],
                             (MMP_UBYTE *)&m_Qtable[DSC_QTABLE_ARRAY_SIZE],
                             (MMP_UBYTE *)&m_Qtable[DSC_QTABLE_ARRAY_SIZE],
                             MMP_DSC_JPEG_QT_AIT_HIGH);
+
+    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetQTableIntoOpr(MMP_DSC_JPEG_RC_ID_CAPTURE);
+
+    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetCapturePath(obj->pipe.scalerpath,
                             obj->pipe.icopipeID,
                             obj->pipe.ibcpipeID);
 
+    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_JStream_TriggerEncode(obj->id);
 
     return MMP_ERR_NONE;

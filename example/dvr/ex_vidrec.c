@@ -516,6 +516,8 @@ void Jpeg_Stream(void)
     propt.size = 1500;       // 500KB	propt.size * 5/4 * 95/100 < propt.bufsize
     propt.bufsize = 2000*1024;   // 900KB
 
+    printc("%s %d\r\n", __func__, __LINE__);
+
     id = Jpeg_Init(MMP_FALSE);  // Get stream id resource, but not occupy it
     if (id < MAX_JPG_STREAM_NUM)
         Jpeg_Open(id, &propt);
@@ -1068,7 +1070,7 @@ int Audio_GetAttribute(MMP_ULONG id, MMPS_ASTREAM_PROPT **propt)
 MMP_ULONG Jpeg_Init(MMP_BOOL occupy)
 {
     MMP_ULONG id;
-
+    printc("%s %d\r\n", __func__, __LINE__);
     /* If any JPEG stream is opened, skip open */
     for(id = 0; id < MAX_JPG_STREAM_NUM; id++) {
         if (m_JpgStream[id].obj && !m_JpgStream[id].inuse) {
@@ -1113,13 +1115,15 @@ int Jpeg_Open(MMP_ULONG id, MMPS_JSTREAM_PROPT *propt)
     printc("Jpeg%d_Open\r\n", id);
     //printc("key_map 0x%x\r\n", key_map);
 
-	change_effect_mode(ADC_Get_Effect());
+//	change_effect_mode(ADC_Get_Effect());
+    printc("%s %d\r\n", __func__, __LINE__);
     m_JpgStream[id].obj = MMPS_JStream_Open(propt);
     if (!m_JpgStream[id].obj) {
         printc("\t-> failed\r\n");
         m_JpgStream[id].inuse = MMP_FALSE;
         return -2;
     }
+    printc("%s %d\r\n", __func__, __LINE__);
     Set_Obj_Pipe(m_JpgStream[id].obj->pipe.ibcpipeID , id, V4L2_PIX_FMT_MJPEG );
     return 0;
 }

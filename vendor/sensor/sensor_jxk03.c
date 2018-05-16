@@ -584,7 +584,7 @@ static void SNR_Cust_InitConfig(void)
 	SensorCustFunc.VifSetting->powerOffSetting.usExtPowerPin 		= MMP_GPIO_MAX; // it might be defined in Config_SDK.h
 
 	SensorCustFunc.VifSetting->clockAttr.bClkOutEn 					= MMP_TRUE;
-	SensorCustFunc.VifSetting->clockAttr.ubClkFreqDiv 				= 0;
+	SensorCustFunc.VifSetting->clockAttr.ubClkFreqDiv 				= 2;
 	SensorCustFunc.VifSetting->clockAttr.ulMClkFreq 				= 24000;
 	SensorCustFunc.VifSetting->clockAttr.ulDesiredFreq 				= 24000;
 	SensorCustFunc.VifSetting->clockAttr.ubClkPhase 				= MMPF_VIF_SNR_PHASE_DELAY_NONE;

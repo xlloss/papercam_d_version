@@ -1338,9 +1338,11 @@ void UI_Main_Task(void *p_arg)
     IO_Init();
 
     if (menu.bAutoShot) {
+        printc("%s %d\r\n", __func__, __LINE__);
         #if (V4L2_JPG)
         if (menu.ubBootMode == BOOT_MODE_CAMERA) {
             #if (V4L2_JPG)
+            printc("%s %d\r\n", __func__, __LINE__);
             Jpeg_Stream();
             #endif
         }

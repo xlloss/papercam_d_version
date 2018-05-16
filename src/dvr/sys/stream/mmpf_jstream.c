@@ -143,7 +143,7 @@ MMP_ERR MMPF_JStream_Start( MMP_ULONG           id,
                             IPC_STREAMER_OPTION opt)
 {
     MMPF_JSTREAM_CLASS *jobj = JSTREAM_OBJ(id);
-
+    printc("%s %d\r\n", __func__, __LINE__);
     if (jobj->state != JSTREAM_STATE_OPEN)
         return MMP_JSTREAM_ERR_STATE;
 
@@ -191,6 +191,7 @@ MMP_ERR MMPF_JStream_Stop(MMP_ULONG id)
 */
 void MMPF_JStream_TriggerEncode(MMP_ULONG id)
 {
+    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_OS_SetFlags(DSC_Flag, DSC_FLAG_TRIGGER_STILL, MMPF_OS_FLAG_SET);
 }
 
@@ -198,7 +199,7 @@ MMP_ERR MMPF_JStream_GetFrame(MMP_ULONG id,MMP_ULONG *jpg_addr , MMP_ULONG *jpg_
 {
     MMPF_JSTREAM_CLASS *jobj = JSTREAM_OBJ(id);
     MMP_ULONG available, addr, size, time;
-
+    printc("%s %d\r\n", __func__, __LINE__);
     *jpg_addr = 0 ;
     *jpg_size = 0 ;
     if( ! jobj) {
@@ -481,13 +482,19 @@ void MMPF_JStream_Task(void)
                             0, &flags);
 
         if (flags & DSC_FLAG_TRIGGER_STILL) {
+            printc("%s %d\r\n", __func__, __LINE__);
             MMPF_Sensor_Wait3AConverge(PRM_SENSOR);
+            printc("%s %d\r\n", __func__, __LINE__);
             MMPF_DSC_EncodeJpeg(PRM_SENSOR, MMPF_DSC_SRC_SENSOR,
                                 MMPF_DSC_SHOTMODE_SINGLE);
+            printc("%s %d\r\n", __func__, __LINE__);
             MMPF_DSC_GetJpeg(&frminfo.addr, &frminfo.size, &frminfo.time);
+            printc("%s %d\r\n", __func__, __LINE__);
             // TODO: here always use ID 0 for JPEG stream
             MMPF_JStream_PushFrameInfo(0, &frminfo);
+            printc("%s %d\r\n", __func__, __LINE__);
             MMPF_OS_SetFlags(STREAMER_Flag, SYS_FLAG_JSTREAM(0), MMPF_OS_FLAG_SET);
+            printc("%s %d\r\n", __func__, __LINE__);
             MMPF_SYS_DumpTimerMark();
             #if SUPPORT_UVC_JPEG==1
             {
