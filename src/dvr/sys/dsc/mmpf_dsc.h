@@ -44,7 +44,7 @@
 #define JPEG_SCALE_FACTOR_MAX       (0x3FFF)
 
 // In normal case, polling time is 34ms, set x10 for time out
-#define DSC_TIMEOUT_MS			    (340)
+#define DSC_TIMEOUT_MS			    (340*3)
 
 #define DSC_CAPTURE_DONE_SEM_TIMEOUT    (5000)
 

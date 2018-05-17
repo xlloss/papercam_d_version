@@ -855,6 +855,7 @@ MMP_IBC_PIPEID MMPD_Fctl_AllocatePipe(MMP_ULONG width, MMPD_FCTL_LINK_TO dst)
                     if (!pipe_sel || (m_stPipe[p].max_w < max_w_sel)) {
                         pipe_sel  = &m_stPipe[p];
                         max_w_sel = pipe_sel->max_w;
+						break;
                     }
                 }
             }

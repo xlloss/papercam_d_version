@@ -31,6 +31,8 @@
 #include "ait_osd.h"
 #include "ex_misc.h"
 
+#include "mmpd_icon.h"
+#include "simple_gui_bitmap.h"
 
 #if (USER_STRING)
 extern void small_sprintf(char* s,char *fmt, ...);
@@ -1319,10 +1321,13 @@ void dump_reg()
 }
 #endif
 
+#define JPG_SIZE_5M 1
+
 void UI_Main_Task(void *p_arg)
 {
     MMPF_OS_FLAGS wait_flags = 0, flags;
     MMP_USHORT alarmPeriod,alarmOn;
+    MMP_STICKER_ATTR sticker_buf_attr;
 	unsigned char gpio_value;
 
 #if CONFIG_HW_FOR_DRAM_TIMIMG_TEST
@@ -1337,12 +1342,36 @@ void UI_Main_Task(void *p_arg)
     // initial IO after get boot setting
     IO_Init();
 
+    /* Set primary sticker */
+    sticker_buf_attr.ubStickerId      = MMP_STICKER_PIPE0_ID0;
+    sticker_buf_attr.ulBaseAddr       = (MMP_ULONG)bmicon.pData;
+#if (JPG_SIZE_5M == 1)
+    sticker_buf_attr.usStartX         = 50;
+    sticker_buf_attr.usStartY         = 50;
+#else
+    sticker_buf_attr.usStartX         = 400;
+    sticker_buf_attr.usStartY         = 300;
+#endif
+    sticker_buf_attr.usWidth          = 128;
+    sticker_buf_attr.usHeight         = 77;
+    sticker_buf_attr.colorformat      = MMP_ICON_COLOR_RGB565;
+    sticker_buf_attr.bTpEnable        = MMP_FALSE;
+    sticker_buf_attr.bSemiTpEnable    = MMP_TRUE;
+    sticker_buf_attr.ubIconWeight     = 12;
+    sticker_buf_attr.ubDstWeight      = 4;
+
     if (menu.bAutoShot) {
         printc("%s %d\r\n", __func__, __LINE__);
         #if (V4L2_JPG)
         if (menu.ubBootMode == BOOT_MODE_CAMERA) {
             #if (V4L2_JPG)
             printc("%s %d\r\n", __func__, __LINE__);
+            /* for water mark */
+            MMPD_Icon_SetAttributes(MMP_STICKER_PIPE0_ID0, &sticker_buf_attr);
+            MMPD_Icon_SetTransparent(MMP_STICKER_PIPE0_ID0, TRUE, 0x000000);
+
+            /* enable water mark or not */
+            MMPD_Icon_SetEnable(MMP_STICKER_PIPE0_ID0, FALSE);
             Jpeg_Stream();
             #endif
         }
