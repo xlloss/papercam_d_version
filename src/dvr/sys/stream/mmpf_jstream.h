@@ -90,6 +90,7 @@ MMP_ERR     MMPF_JStream_Stop(MMP_ULONG id);
 void        MMPF_JStream_TriggerEncode(MMP_ULONG id);
 void        MMPF_JStream_TransferData(MMP_ULONG id);
 MMP_ERR     MMPF_JStream_GetFrame(MMP_ULONG id,MMP_ULONG *jpg_addr , MMP_ULONG *jpg_size);
+void MMPF_JStream_AcqEncSem();//for thumb
 
 /// @}
 

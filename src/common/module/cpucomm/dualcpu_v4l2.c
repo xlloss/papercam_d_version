@@ -831,15 +831,19 @@ extern void MMPF_AEC_Pause(MMP_BOOL pause);
     switch(fmt) {
     #if (V4L2_JPG)
     case V4L2_PIX_FMT_MJPEG:
+        printc("+++%s %d\r\n", __func__, __LINE__);
         aitcam_ipc_set_mjpg_propt(streamid, &j_propt, &opt);
         if (Jpeg_Open(id, &j_propt) == 0) {
+            printc("%s %d\r\n", __func__, __LINE__);
             Jpeg_On(id, streamid, opt);
             success = MMP_TRUE;
         }
         else {
+            printc("%s %d\r\n", __func__, __LINE__);
             jpg_stream_tbl[id].streamid = AITCAM_NUM_CONTEXTS;
             jpg_stream_tbl[id].used     = 0;
         }
+        printc("---%s %d\r\n", __func__, __LINE__);
         break;
     #endif
     #if (V4L2_AAC)
@@ -1085,8 +1089,9 @@ void DualCpu_V4L2Task(void* pData)
 
     //printc("DualCpu_V4L2 Start\r\n");
     RTNA_DBG_Str0("[V4L2]\r\n");
+    printc("Slash[V4L2]\r\n");
 
-    if (0) { //(v4l2_debug) {
+    if (1) { //(v4l2_debug) {
         printc("sizeof(AITCAM_VIDBUF_QUEUE): %d\r\n", sizeof(AITCAM_VIDBUF_QUEUE));
         printc("sizeof(AITCAM_VIDBUF_INFO) : %d\r\n", sizeof(AITCAM_VIDBUF_INFO));
         printc("sizeof(AITCAM_VIDENC_QUEUE): %d\r\n", sizeof(AITCAM_VIDENC_QUEUE));
@@ -1119,21 +1124,35 @@ void DualCpu_V4L2Task(void* pData)
             
             cmd_handle = NULL;
 
+            printc("----->%s cmd %d\r\n", __func__, cmd);
+
             switch(cmd) {
             case IPC_V4L2_GET_JPG:
             {
-                MMP_ULONG jpg_addr,jpg_size ;
+                MMP_ULONG jpg_addr, jpg_size, jpg_faddr = 0;//add first addr for thumb ;
+                printc("----->IPC_V4L2_GET_JPG\r\n");
+
                 V4L2_Return->phy_addr   = 0;
                 V4L2_Return->size       = 0;
                 V4L2_Return->command = cmd;
-                if(MMPF_JStream_GetFrame(0,&jpg_addr,&jpg_size)==MMP_ERR_NONE ) {                  
-                  V4L2_Return->result     = 0 ;
-                  V4L2_Return->phy_addr   = jpg_addr;
-                  V4L2_Return->size       = jpg_size;
-                }  
-                else {
-                  V4L2_Return->result     = 1 ;
+
+                V4L2_Return->result     = 1;//preset to 1 => failed for thumb
+
+                //if(MMPF_JStream_GetFrame(0,&jpg_addr,&jpg_size)==MMP_ERR_NONE ) {                  
+                while(MMPF_JStream_GetFrame(0, &jpg_addr, &jpg_size) == MMP_ERR_NONE ) {
+                    printc("###JPG OKOK addr=0x%x, size=%d\r\n", jpg_addr, jpg_size);//for thumb
+                    if (jpg_faddr == 0)
+                        jpg_faddr = jpg_addr;
+
+                    V4L2_Return->result     = 0 ;
+                    //V4L2_Return->phy_addr   = jpg_addr;
+                    V4L2_Return->phy_addr   = jpg_faddr;//for thumb;
+                    //V4L2_Return->size       = jpg_size;
+                    V4L2_Return->size       = jpg_addr - jpg_faddr + jpg_size;//for thumb;
                 }
+                //else {
+                //  V4L2_Return->result     = 1 ;
+                //}
                 break;  
             }
             case IPC_IQ_TUNING:
@@ -1214,12 +1233,14 @@ void DualCpu_V4L2Task(void* pData)
                   ret = aitcam_ipc_get_ctrl(ipc_ctrl);
                   V4L2_Return->phy_addr   = ipc_ctrl->val;
                 }
+
                 V4L2_Return->command = cmd;
                 V4L2_Return->result     = (unsigned long) ret;
                 
                 V4L2_Return->size       = 0;
                 break;
             }
+
             default:
                 printc("no such command\r\n");
                 V4L2_Return->command = IPC_V4L2_NOT_SUPPORT;
@@ -1315,6 +1336,13 @@ int aitcam_ipc_open(aitcam_img_info *img_info)
     }
     else if ((v4l2_stream[streamid].state != IPC_V4L2_NOT_SUPPORT) &&
             (v4l2_stream[streamid].state != IPC_V4L2_RELEASE)) {
+
+        if((v4l2_stream[streamid].state == IPC_V4L2_STREAMOFF)) {
+            printc("state = IPC_V4L2_STREAMOFF\r\n");
+            v4l2_stream[streamid].info.img_info = *img_info;
+            v4l2_stream[streamid].state = IPC_V4L2_STREAMOFF;
+            return 0;
+        }
         return -2;
     }
 
@@ -1336,6 +1364,7 @@ int aitcam_ipc_open(aitcam_img_info *img_info)
 
     #if (V4L2_JPG)
     case V4L2_PIX_FMT_MJPEG:
+        printc("%s %d\r\n", __func__, __LINE__);
         id = Jpeg_Init(MMP_TRUE);
         if (id < MAX_JPG_STREAM_NUM) {
             jpg_stream_tbl[id].streamid = streamid;
@@ -1378,7 +1407,7 @@ int aitcam_ipc_open(aitcam_img_info *img_info)
     if (success) {
         v4l2_stream[streamid].info.img_info = *img_info;
         v4l2_stream[streamid].state = IPC_V4L2_OPEN;
-        if (v4l2_debug) {
+        if (1) {
             printc(" -obj_id           : %d\r\n",    id);
             printc(" -width/bitrate    : %d\r\n",    img_info->P1.img_width);
             printc(" -height/sampelrate: %d\r\n",    img_info->P2.img_height);
@@ -1432,6 +1461,9 @@ int aitcam_ipc_streamon(aitcam_ipc_info *ipc_info)
     stream_info->vbq_phy_addr   = ipc_info->vbq_phy_addr;
     stream_info->vbq_virt_addr  = ipc_info->vbq_virt_addr;
     stream_info->remote_q_size  = ipc_info->remote_q_size;
+    printc("stream_info->vbq_phy_addr  0x%x\r\n", stream_info->vbq_phy_addr);
+    printc("stream_info->vbq_virt_addr 0x%x\r\n", stream_info->vbq_virt_addr);
+    printc("stream_info->remote_q_size 0x%x\r\n", stream_info->remote_q_size);
 
     switch(ipc_info->img_info.img_fmt) {
     case V4L2_PIX_FMT_H264:
@@ -1949,6 +1981,8 @@ int aitcam_ipc_set_ctrl(aitcam_ipc_ctrl *ctrl)
 
 int push_q(AITCAM_VIDENC_QUEUE *queue, MMP_UBYTE buffer)
 {
+    printc("%s %d\r\n", __func__, __LINE__);
+
     if (queue->size >= AITCAM_MAX_QUEUE_SIZE) {
         printc(0, "Queue overflow\r\n");
         return 0;
@@ -1961,6 +1995,8 @@ int push_q(AITCAM_VIDENC_QUEUE *queue, MMP_UBYTE buffer)
 MMP_UBYTE pop_q(AITCAM_VIDENC_QUEUE *queue, MMP_UBYTE offset)
 {
     MMP_UBYTE buffer, target, source;
+
+    printc("%s %d\r\n", __func__, __LINE__);
 
     if (queue->size == 0) {
         printc( "Queue underflow\n");
@@ -1983,6 +2019,7 @@ MMP_UBYTE pop_q(AITCAM_VIDENC_QUEUE *queue, MMP_UBYTE offset)
 void aitcam_ipc_push_vbq(AITCAM_VIDBUF_QUEUE *pVbq, MMP_UBYTE q_select,
                          MMP_UBYTE buf_id)
 {
+    printc("%s %d\r\n", __func__, __LINE__);
     if (buf_id >= pVbq->buf_num)
         return;
 
@@ -1998,6 +2035,7 @@ void aitcam_ipc_push_vbq(AITCAM_VIDBUF_QUEUE *pVbq, MMP_UBYTE q_select,
 
 MMP_UBYTE aitcam_ipc_pop_vbq(AITCAM_VIDBUF_QUEUE *pVbq, MMP_UBYTE q_select)
 {
+    printc("%s %d\r\n", __func__, __LINE__);
     if (q_select == VIDBUF_FREE_QUEUE) {
         return pop_q(&pVbq->free_vbq, 0);
     }
@@ -2009,6 +2047,8 @@ MMP_UBYTE aitcam_ipc_pop_vbq(AITCAM_VIDBUF_QUEUE *pVbq, MMP_UBYTE q_select)
 void *aitcam_ipc_get_q(MMP_UBYTE streamid)
 {
     AITCAM_VIDBUF_QUEUE *queue;
+
+    printc("%s %d\r\n", __func__, __LINE__);
 
     if (streamid >= AITCAM_NUM_CONTEXTS) {
         return NULL;

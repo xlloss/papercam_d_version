@@ -1116,14 +1116,14 @@ int Jpeg_Open(MMP_ULONG id, MMPS_JSTREAM_PROPT *propt)
     //printc("key_map 0x%x\r\n", key_map);
 
 //	change_effect_mode(ADC_Get_Effect());
-    printc("%s %d\r\n", __func__, __LINE__);
+    printc("%s %d +++\r\n", __func__, __LINE__);
     m_JpgStream[id].obj = MMPS_JStream_Open(propt);
     if (!m_JpgStream[id].obj) {
         printc("\t-> failed\r\n");
         m_JpgStream[id].inuse = MMP_FALSE;
         return -2;
     }
-    printc("%s %d\r\n", __func__, __LINE__);
+    printc("%s %d ---\r\n", __func__, __LINE__);
     Set_Obj_Pipe(m_JpgStream[id].obj->pipe.ibcpipeID , id, V4L2_PIX_FMT_MJPEG );
     return 0;
 }

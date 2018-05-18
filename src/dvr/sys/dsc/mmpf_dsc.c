@@ -783,7 +783,7 @@ MMP_ERR	MMPF_DSC_EncodeJpeg(MMP_UBYTE ubSnrSel, MMPF_DSC_IMAGE_SOURCE SourcePath
 {
     AITPS_JPG   pJPG = AITC_BASE_JPG;
     MMP_UBYTE   ubRcIdx = MMP_DSC_JPEG_RC_ID_CAPTURE;
-
+    printc("%s %d\r\n", __func__, __LINE__);
     m_JpegSourcePath = SourcePath;
     m_JpegShotMode   = ubShotMode;
 
@@ -858,7 +858,7 @@ MMP_ERR	MMPF_DSC_EncodeJpeg(MMP_UBYTE ubSnrSel, MMPF_DSC_IMAGE_SOURCE SourcePath
             if (MMPF_OS_AcquireSem(m_JpgEncDoneSem, DSC_CAPTURE_DONE_SEM_TIMEOUT) != MMP_ERR_NONE) {
                 MMP_PRINT_RET_ERROR(DSC_DBG_LEVEL, 0, "Wait m_JpgEncDoneSem Failed\r\n");
 			}
-			
+
 			if (!m_bScaleOK[ubRcIdx]) 
 			{
 				RTNA_DBG_Str(3, "Size is not fit the target\r\n");

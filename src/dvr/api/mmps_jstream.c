@@ -20,6 +20,7 @@
 #include "mmpf_mci.h"
 #include "mmpf_dsc.h"
 #include "mmpf_jstream.h"
+#include "mmpd_scaler.h"
 
 /** @addtogroup MMPS_JSTREAM
 @{
@@ -68,7 +69,7 @@ static const MMP_UBYTE m_Qtable[128] =
 
 static MMP_ERR MMPS_JStream_ReserveHeap(void);
 
-static MMP_ERR MMPS_JStream_AssignBuf(  MMPS_JSTREAM_CLASS      *obj);
+static MMP_ERR MMPS_JStream_AssignBuf(  MMPS_JSTREAM_CLASS      *obj, MMP_ULONG offset);
 
 #if (DBG_JSTREAM_MEM_MAP)
 static void    MMPS_JStream_MemMapDbg(  MMPS_JSTREAM_CLASS      *obj);
@@ -77,6 +78,7 @@ static void    MMPS_JStream_MemMapDbg(  MMPS_JSTREAM_CLASS      *obj);
 static MMP_ERR MMPS_JStream_ConfigPipe( MMPS_JSTREAM_CLASS      *obj);
 
 static MMP_ERR MMPS_JStream_OpenEncoder(MMPS_JSTREAM_CLASS *obj);
+static MMP_ERR MMPS_JStream_OpenEncoder2(MMPS_JSTREAM_CLASS *obj, MMP_ULONG offset);//cch
 static MMP_ERR MMPS_JStream_CloseEncoder(MMPS_JSTREAM_CLASS *obj);
 
 //==============================================================================
@@ -106,17 +108,18 @@ int MMPS_JStream_ModInit(void)
 
     if (_init == MMP_FALSE) {
         MEMSET(&m_ShareLineBuf, 0, sizeof(m_ShareLineBuf));
-
+		printc("0000000000000001 MMPS_JStream_ModInit\r\n");
         for(s = 0; s < MAX_JPG_STREAM_NUM; s++) {
             obj = &m_JStream[s];
             MEMSET(obj, 0, sizeof(MMPS_JSTREAM_CLASS));
             if (s < gulMaxJStreamNum)
                 obj->cap = &gstJStreamCap[s];
         }
+//		if (_init == MMP_FALSE) {	
+        	MMPS_JStream_ReserveHeap(); // Reserve heap buffer for each stream
 
-        MMPS_JStream_ReserveHeap(); // Reserve heap buffer for each stream
-
-        _init = MMP_TRUE;
+        	_init = MMP_TRUE;
+//		}
     }
     return 0;
 }
@@ -125,6 +128,10 @@ int MMPS_JStream_ModInit(void)
 void ____JStream_Obj_Function____(){ruturn;} //dummy
 #endif
 
+MMP_BOOL encode_done = 1;
+MMP_ULONG thumbnail_size = 0;
+MMP_ULONG header_size = 0;
+MMP_ULONG jpeg_offset = 0;
 //------------------------------------------------------------------------------
 //  Function    : MMPS_JStream_Open
 //  Description :
@@ -144,12 +151,10 @@ MMPS_JSTREAM_CLASS *MMPS_JStream_Open(MMPS_JSTREAM_PROPT *propt)
     MMP_ULONG frm_size = 0, buf_size = 0;
     MMP_ULONG cand_frm_size = 0, cand_buf_size = 0;
     MMPS_JSTREAM_CLASS *obj = NULL;
-
-    printc("%s %d\r\n", __func__, __LINE__);
+	MMPS_JSTREAM_PROPT thumb_propt;
 
     if (!propt)
     	return NULL;
-    printc("%s %d\r\n", __func__, __LINE__);
 
     req_frm_size = ALIGN16(propt->w) * ALIGN16(propt->h);
     req_buf_size = propt->bufsize;
@@ -157,6 +162,9 @@ MMPS_JSTREAM_CLASS *MMPS_JStream_Open(MMPS_JSTREAM_PROPT *propt)
     /* Search a stream whose capability is best-fit with the request feature */
     for(s = 0; s < MAX_JPG_STREAM_NUM; s++) {
         if (m_JStream[s].state == IPC_STREAMER_IDLE) {
+
+			printc("aaaa MMPS_JStream_Open======\r\n");
+
             frm_size = ALIGN16(m_JStream[s].cap->img_w) *
                        ALIGN16(m_JStream[s].cap->img_h);
             buf_size = m_JStream[s].cap->bufsize;
@@ -189,8 +197,67 @@ MMPS_JSTREAM_CLASS *MMPS_JStream_Open(MMPS_JSTREAM_PROPT *propt)
         printc("JStream open err\r\n");
         return NULL;
     }
-    printc("%s jstreamer ID %d\r\n", __func__, obj->id);
-    /* Assign pipe resource */
+
+#if 1    /* Assign pipe resource */
+    pipe = MMPD_Fctl_AllocatePipe(ALIGN16(propt->w), PIPE_LINK_JPG);
+	printc("####MMPD_Fctl_AllocatePipe = %d\r\n",pipe);
+    if (pipe > MMP_IBC_PIPE_MAX) {
+        RTNA_DBG_Str(0, "#JStream alloc pipe err\r\n");
+		goto _jpipe_err;
+    }
+
+    FCTL_PIPE_TO_LINK(pipe, obj->pipe);
+#endif
+    /* Open encoder for thumbnail*/
+    printc("%s %d Open encoder for thumbnail\r\n", __func__, __LINE__);
+//  propt->w = 160;//2560;
+//  propt->h = 120;//1920;
+//  propt->size = 15;//00;
+
+  propt->w = 2560;//2560;
+  propt->h = 1920;//1920;
+  propt->size = 1500;//00;
+
+
+    printc("%s %d propt.w %d propt.h %d\r\n",
+        __func__, __LINE__, propt->w, propt->h);
+
+	encode_done = 0;
+	thumbnail_size = 0;
+	header_size = 0;
+
+    printc("setting propt to Encoder\r\n");
+	obj->propt = *propt;
+    printc("%s %d MMPS_JStream_OpenEncoder 1+++\r\n", __func__, __LINE__);
+    err = MMPS_JStream_OpenEncoder(obj);
+    printc("%s %d MMPS_JStream_OpenEncoder 1---\r\n", __func__, __LINE__);
+    if (err != MMP_ERR_NONE) {
+        RTNA_DBG_Str(0, "#JStream open enc err\r\n");
+        goto _jenc_err;
+    }
+
+
+//wait sema
+    printc("%s %d wait sema\r\n", __func__, __LINE__);
+	MMPF_JStream_AcqEncSem();//acqure sem make sure main jpg encoded done
+    MMPF_JSTREAM_FRAMEINFO frminfo;
+    MMPF_DSC_GetJpeg(&frminfo.addr, &frminfo.size, &frminfo.time);
+    printc("### MMPF_JStream_TriggerEncode1 down, frminfo.size=%d\r\n",frminfo.size);//log for thumb
+
+	err = MMPS_JStream_CloseEncoder(obj);
+    if (err != MMP_ERR_NONE) {
+		RTNA_DBG_Str(0, "#JStream close enc err\r\n");
+    }
+
+	MMPD_Fctl_ReleasePipe(obj->pipe.ibcpipeID);
+	obj->state = IPC_STREAMER_OPEN;
+    printc("%s %d close encoder\r\n", __func__, __LINE__);
+
+
+///start second capture
+    printc("%s %d start second capture\r\n", __func__, __LINE__);
+	//MMPF_OS_Sleep(10);
+	/* Assign pipe resource */
     pipe = MMPD_Fctl_AllocatePipe(ALIGN16(propt->w), PIPE_LINK_JPG);
     if (pipe > MMP_IBC_PIPE_MAX) {
         RTNA_DBG_Str(0, "#JStream alloc pipe err\r\n");
@@ -198,15 +265,42 @@ MMPS_JSTREAM_CLASS *MMPS_JStream_Open(MMPS_JSTREAM_PROPT *propt)
     }
 
     FCTL_PIPE_TO_LINK(pipe, obj->pipe);
-
-    /* Open encoder */
+	MMPD_IBC_ResetModule(obj->pipe.ibcpipeID);
+	MMPD_System_ResetHModule(MMPD_SYS_MDL_JPG, MMP_FALSE);
+	MMPD_Scaler_ResetModule(obj->pipe.scalerpath);
+	
+	/* Open encoder */
+    printc("%s %d Open encoder for Normal\r\n", __func__, __LINE__);
     obj->propt = *propt;
-    err = MMPS_JStream_OpenEncoder(obj);
+
+  propt->w = 160;//2560;
+  propt->h = 120;//1920;
+  propt->size = 15;//00;
+
+
+//	propt->w = 2560;//160;//thumb_propt.w;
+// 	propt->h = 1920;//thumb_propt.h;
+// 	propt->size = 1500;//thumb_propt.size;
+
+    encode_done = 0;
+    thumbnail_size = 0;
+    header_size = 0;
+
+    obj->propt = *propt;
+    printc("%s %d MMPS_JStream_OpenEncoder 2+++\r\n", __func__, __LINE__);
+    err = MMPS_JStream_OpenEncoder2(obj, ALIGN256(frminfo.size));
     if (err != MMP_ERR_NONE) {
         RTNA_DBG_Str(0, "#JStream open enc err\r\n");
         goto _jenc_err;
     }
+    printc("%s %d MMPS_JStream_OpenEncoder 2---\r\n", __func__, __LINE__);
 
+    MMPF_JStream_AcqEncSem();//acqure sem make sure main jpg encoded done
+    //MMPF_JSTREAM_FRAMEINFO frminfo;
+    MMPF_DSC_GetJpeg(&frminfo.addr, &frminfo.size, &frminfo.time);
+    printc("### MMPF_JStream_TriggerEncode2 down, frminfo.size=%d\r\n",frminfo.size);//log for thumb
+
+    /////////////////////////////
     obj->state = IPC_STREAMER_OPEN;
 
     return obj;
@@ -214,7 +308,7 @@ MMPS_JSTREAM_CLASS *MMPS_JStream_Open(MMPS_JSTREAM_PROPT *propt)
 _jenc_err:
     MMPD_Fctl_ReleasePipe(pipe);
 
-_jpipe_err:
+ _jpipe_err:
     MMPF_JStream_Delete(obj->id);
 
     return NULL;
@@ -312,6 +406,7 @@ MMP_ERR MMPS_JStream_Close(MMPS_JSTREAM_CLASS *obj)
     }
 
     MMPD_Fctl_ReleasePipe(obj->pipe.ibcpipeID);
+
     MMPF_JStream_Delete(obj->id);
 
     obj->state = IPC_STREAMER_IDLE;
@@ -325,7 +420,8 @@ void ____JStream_Internal_Function____(){ruturn;} //dummy
 
 //------------------------------------------------------------------------------
 //  Function    : MMPS_JStream_ReserveBuf
-//  Description :
+//  :q
+//Description :
 //------------------------------------------------------------------------------
 /**
  @brief Reserve memory for JPEG stream.
@@ -358,7 +454,7 @@ static MMP_ERR MMPS_JStream_ReserveHeap(void)
             // compress buffer
             obj->heap.size = ALIGN32(obj->cap->bufsize);
             obj->heap.base = MMPF_SYS_HeapMalloc(SYS_HEAP_DRAM,
-                                                 obj->heap.size, 32);
+                                                 obj->heap.size, 256/*32*/);//cch
             if (obj->heap.base == SYS_HEAP_MEM_INVALID)
                 return MMP_ASTREAM_ERR_MEM_EXHAUSTED;
             obj->heap.end  = obj->heap.base + obj->heap.size;
@@ -379,6 +475,52 @@ static MMP_ERR MMPS_JStream_ReserveHeap(void)
 
  @retval It reports the status of the operation.
 */
+#if 1
+static MMP_ERR MMPS_JStream_AssignBuf(MMPS_JSTREAM_CLASS *obj, MMP_ULONG offset)
+{
+    MMPS_JSTREAM_PROPT  *propt = &obj->propt;
+    MMP_DSC_CAPTURE_BUF dscbuf;
+
+    /*
+     * Assign line buffers from the shared buf
+     */
+    obj->linebuf.base = m_ShareLineBuf.base;
+    obj->linebuf.size = ALIGN8(propt->w) * 2 * 16;
+    obj->linebuf.end  = obj->linebuf.base + obj->linebuf.size;
+    if (obj->linebuf.end > m_ShareLineBuf.end) {
+        printc("###obj->linebuf.end=%d,m_ShareLineBuf.end=%d\r\n",obj->linebuf.end,m_ShareLineBuf.end);
+        return MMP_JSTREAM_ERR_BUF;
+    }
+
+    /*
+     * Allocate compress buffer
+     */
+    obj->compbuf.base = obj->heap.base + offset;//offset addr for thumb
+    obj->compbuf.size = propt->bufsize - offset;//ofset addr for thumb
+    obj->compbuf.end  = obj->compbuf.base + obj->compbuf.size;
+    if (obj->compbuf.end > obj->heap.end) {
+        printc("###obj->compbuf.end=%d,obj->heap.end=%d",obj->compbuf.end,obj->heap.end);
+        return MMP_JSTREAM_ERR_BUF;
+    }
+    // TODO: assign the buffer to encoder
+
+	
+    #if (DBG_JSTREAM_MEM_MAP)
+    MMPS_JStream_MemMapDbg(obj);
+    #endif
+    printc("###compbuf.base = 0x%x, compbuf.size=%d\r\n",obj->compbuf.base,obj->compbuf.size);//log for thumb
+    dscbuf.ulCompressStart  = obj->compbuf.base;
+    dscbuf.ulCompressEnd    = obj->compbuf.end;
+    dscbuf.ulLineStart      = obj->linebuf.base;
+    dscbuf.ul2ndLineStart   = 0;
+    MMPF_DSC_SetCaptureBuffers(&dscbuf);
+
+    return MMP_ERR_NONE;
+}
+
+
+#else
+
 static MMP_ERR MMPS_JStream_AssignBuf(MMPS_JSTREAM_CLASS *obj)
 {
     MMPS_JSTREAM_PROPT  *propt = &obj->propt;
@@ -392,13 +534,14 @@ static MMP_ERR MMPS_JStream_AssignBuf(MMPS_JSTREAM_CLASS *obj)
     obj->linebuf.end  = obj->linebuf.base + obj->linebuf.size;
     if (obj->linebuf.end > m_ShareLineBuf.end)
         return MMP_JSTREAM_ERR_BUF;
-
+	
     /*
      * Allocate compress buffer
      */
 	obj->compbuf.base = obj->heap.base;
     obj->compbuf.size = propt->bufsize;
     obj->compbuf.end  = obj->compbuf.base + obj->compbuf.size;
+	printc("==========%x %d %x\r\n", obj->compbuf.base, obj->compbuf.size, obj->compbuf.end);
     if (obj->compbuf.end > obj->heap.end)
         return MMP_JSTREAM_ERR_BUF;
 
@@ -408,7 +551,18 @@ static MMP_ERR MMPS_JStream_AssignBuf(MMPS_JSTREAM_CLASS *obj)
     MMPS_JStream_MemMapDbg(obj);
     #endif
 
-    dscbuf.ulCompressStart  = obj->compbuf.base;
+	if (encode_done == 0) {
+		// for thumbnail
+		dscbuf.ulCompressStart  = obj->compbuf.base;
+	} else {
+		dscbuf.ulCompressStart  = obj->compbuf.base+header_size+thumbnail_size; // skip for header
+		jpeg_offset = dscbuf.ulCompressStart;
+		printc("==========dscbuf.ulCompressStart %x\r\n", dscbuf.ulCompressStart);
+		dscbuf.ulCompressStart  = ALIGN8(dscbuf.ulCompressStart); // skip for header
+		jpeg_offset = dscbuf.ulCompressStart - jpeg_offset;
+		printc("==========dscbuf.ulCompressStart %x jpeg_offset %d\r\n", dscbuf.ulCompressStart, jpeg_offset);
+	}
+	
     dscbuf.ulCompressEnd    = obj->compbuf.end;
     dscbuf.ulLineStart      = obj->linebuf.base;
     dscbuf.ul2ndLineStart   = 0;
@@ -416,7 +570,7 @@ static MMP_ERR MMPS_JStream_AssignBuf(MMPS_JSTREAM_CLASS *obj)
 
 	return MMP_ERR_NONE;
 }
-
+#endif
 //------------------------------------------------------------------------------
 //  Function    : MMPS_JStream_MemMapDbg
 //  Description :
@@ -495,6 +649,7 @@ static MMP_ERR MMPS_JStream_ConfigPipe(MMPS_JSTREAM_CLASS *obj)
                         fitrange.ulOutWidth, fitrange.ulOutHeight);
 
     MMPD_PTZ_CalculatePtzInfo(obj->pipe.scalerpath, 0, 0, 0);
+	
     MMPD_PTZ_GetCurPtzInfo(obj->pipe.scalerpath, &fitrange, &grabEnc);
 
     fctlAttr.colormode          = MMP_DISPLAY_COLOR_YUV422;
@@ -554,18 +709,107 @@ static MMP_ERR MMPS_JStream_EnablePipe( MMPS_JSTREAM_CLASS  *obj,
 
  @retval It reports the status of the operation.
 */
-static MMP_ERR MMPS_JStream_OpenEncoder(MMPS_JSTREAM_CLASS *obj)
+//chrison
+#if 1
+static MMP_ERR MMPS_JStream_OpenEncoder2(MMPS_JSTREAM_CLASS *obj, MMP_ULONG offset)
 {
-    MMP_ULONG           width, height;
+#if 1
+    MMP_ULONG           width, height, pipe;
     MMPS_JSTREAM_PROPT  *propt = &obj->propt;
-    printc("%s %d\r\n", __func__, __LINE__);
+//    propt->w = 2560;
+//    propt->h = 1920;
+//    obj->propt.size =1500;
+
     width  = ALIGN8(propt->w);
     height = ALIGN8(propt->h);
+
+	//////* Assign pipe resource */
+
+    printc("%s %d width %d, height =%d\r\n", __func__, __LINE__, width, height);
+
+	MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_TRUE);
+    if (MMPS_JStream_AssignBuf(obj, offset)) {
+        printc("Alloc mem for jstream failed\r\n");
+		MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_FALSE);
+    }
+
+    MMPS_JStream_ConfigPipe(obj);
+    if (MMPS_JStream_EnablePipe(obj, MMP_TRUE) != MMP_ERR_NONE) {
+        printc("Enable Jpeg pipe: Fail\r\n");
+        return MMP_JSTREAM_ERR_PIPE;
+    }
+
+    /* Configure encoder */
+    MMPF_DSC_SetJpegResol(width, height, MMP_DSC_JPEG_RC_ID_CAPTURE);
+
+
+    MMPF_DSC_SetJpegQualityCtl( MMP_DSC_JPEG_RC_ID_CAPTURE,
+                                MMP_FALSE,
+                                MMP_FALSE,//for thumb
+                                obj->propt.size,
+                                (obj->propt.size * 5) >> 2,
+                                2);//2 for thumb
+
+    MMPF_DSC_SetQTableInfo( MMP_DSC_JPEG_RC_ID_CAPTURE,
+                            (MMP_UBYTE *)&m_Qtable[0],
+                            (MMP_UBYTE *)&m_Qtable[DSC_QTABLE_ARRAY_SIZE],
+                            (MMP_UBYTE *)&m_Qtable[DSC_QTABLE_ARRAY_SIZE],
+                            MMP_DSC_JPEG_QT_AIT_HIGH);
+    MMPF_DSC_SetQTableIntoOpr(MMP_DSC_JPEG_RC_ID_CAPTURE);
+    MMPF_DSC_SetCapturePath(obj->pipe.scalerpath,
+                            obj->pipe.icopipeID,
+                            obj->pipe.ibcpipeID);
+
+    printc("### MMPF_JStream_TriggerEncode2\r\n");
+    MMPF_JStream_TriggerEncode(obj->id);
+//    MMPF_JStream_AcqEncSem();
+//	MMPF_JSTREAM_FRAMEINFO frminfo;
+//    MMPF_DSC_GetJpeg(&frminfo.addr, &frminfo.size, &frminfo.time);
+//    printc("### MMPF_JStream_TriggerEncode2 down, frminfo.size=%d\r\n",frminfo.size);//log for thumb
+    //MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_FALSE);
+
+
+	//MMPD_Fctl_ReleasePipe(pipe);
+	//MMPD_IBC_ResetModule(obj->pipe.ibcpipeID);
+//aki
+	//MMPS_JStream_EnablePipe(obj, MMP_FALSE);
+    //MMPD_System_ResetHModule(MMPD_SYS_MDL_JPG, MMP_FALSE);
+    //MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_FALSE);
+	//MMPD_Fctl_ReleasePipe(pipe);
+#endif
+    return MMP_ERR_NONE;
+}
+#endif
+
+static MMP_ERR MMPS_JStream_OpenEncoder(MMPS_JSTREAM_CLASS *obj)
+{
+    MMP_ULONG           width, height, pipe;
+    MMPS_JSTREAM_PROPT  *propt = &obj->propt;
+
+//	propt->w = 160;////3840;//1920;
+//    propt->h = 120;//2160;//1080;
+//    obj->propt.size = 15;
+
+    width  = ALIGN8(propt->w);
+    height = ALIGN8(propt->h);
+
+    printc("%s %d width %d, height =%d\r\n", __func__, __LINE__, width, height);
+
+	//////* Assign pipe resource */
+    //pipe = MMPD_Fctl_AllocatePipe(ALIGN16(propt->w), PIPE_LINK_JPG);
+    //if (pipe > MMP_IBC_PIPE_MAX) {
+    //    RTNA_DBG_Str(0, "#JStream alloc pipe err\r\n");
+	//	//goto _jpipe_err;
+    //}
+
+    //FCTL_PIPE_TO_LINK(pipe, obj->pipe);
+	//MMPD_IBC_ResetModule(obj->pipe.ibcpipeID);
+
 
     /* Enable clock */
     MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_TRUE);
 
-    if (MMPS_JStream_AssignBuf(obj)) {
+    if (MMPS_JStream_AssignBuf(obj,0)) {
         printc("Alloc mem for jstream failed\r\n");
         #if (DBG_JSTREAM_MEM_MAP)
         MMPS_JStream_MemMapDbg(obj);
@@ -573,19 +817,15 @@ static MMP_ERR MMPS_JStream_OpenEncoder(MMPS_JSTREAM_CLASS *obj)
         MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_FALSE);
         return MMP_JSTREAM_ERR_BUF;
     }
-    printc("%s %d\r\n", __func__, __LINE__);
+
     MMPS_JStream_ConfigPipe(obj);
-    printc("%s %d\r\n", __func__, __LINE__);
     if (MMPS_JStream_EnablePipe(obj, MMP_TRUE) != MMP_ERR_NONE) {
 		printc("Enable Jpeg pipe: Fail\r\n");
         return MMP_JSTREAM_ERR_PIPE;
     }
 
     /* Configure encoder */
-    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetJpegResol(width, height, MMP_DSC_JPEG_RC_ID_CAPTURE);
-
-    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetJpegQualityCtl( MMP_DSC_JPEG_RC_ID_CAPTURE,
                                 MMP_FALSE,
                                 MMP_TRUE,
@@ -593,23 +833,39 @@ static MMP_ERR MMPS_JStream_OpenEncoder(MMPS_JSTREAM_CLASS *obj)
 			                    (obj->propt.size * 5) >> 2,
 			                    1);
 
-    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetQTableInfo( MMP_DSC_JPEG_RC_ID_CAPTURE,
                             (MMP_UBYTE *)&m_Qtable[0],
                             (MMP_UBYTE *)&m_Qtable[DSC_QTABLE_ARRAY_SIZE],
                             (MMP_UBYTE *)&m_Qtable[DSC_QTABLE_ARRAY_SIZE],
                             MMP_DSC_JPEG_QT_AIT_HIGH);
 
-    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetQTableIntoOpr(MMP_DSC_JPEG_RC_ID_CAPTURE);
 
-    printc("%s %d\r\n", __func__, __LINE__);
     MMPF_DSC_SetCapturePath(obj->pipe.scalerpath,
                             obj->pipe.icopipeID,
                             obj->pipe.ibcpipeID);
 
-    printc("%s %d\r\n", __func__, __LINE__);
-    MMPF_JStream_TriggerEncode(obj->id);
+///////////
+	printc("### MMPF_JStream_TriggerEncode1\r\n");//log for thumb
+	MMPF_JStream_TriggerEncode(obj->id);
+//    MMPF_JStream_AcqEncSem();//acqure sem make sure main jpg encoded done
+//    MMPF_JSTREAM_FRAMEINFO frminfo;
+//    MMPF_DSC_GetJpeg(&frminfo.addr, &frminfo.size, &frminfo.time);
+//    printc("### MMPF_JStream_TriggerEncode1 down, frminfo.size=%d\r\n",frminfo.size);//log for thumb
+//	MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_FALSE);
+
+
+////aki
+//	MMPS_JStream_EnablePipe(obj, MMP_FALSE);
+//    MMPD_System_ResetHModule(MMPD_SYS_MDL_JPG, MMP_FALSE);
+//    MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_FALSE);
+//	MMPD_Fctl_ReleasePipe(pipe);
+
+
+ //   MMPS_JStream_OpenEncoder2(obj, ALIGN256(frminfo.size));
+
+
+
 
     return MMP_ERR_NONE;
 }
@@ -628,6 +884,8 @@ static MMP_ERR MMPS_JStream_OpenEncoder(MMPS_JSTREAM_CLASS *obj)
 static MMP_ERR MMPS_JStream_CloseEncoder(MMPS_JSTREAM_CLASS *obj)
 {
     MMPS_JStream_EnablePipe(obj, MMP_FALSE);
+
+	MMPD_Scaler_ResetModule(obj->pipe.scalerpath);
 
     MMPD_System_ResetHModule(MMPD_SYS_MDL_JPG, MMP_FALSE);
     MMPD_System_EnableClock(MMPD_SYS_CLK_JPG, MMP_FALSE);
